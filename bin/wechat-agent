@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+usage() {
+  cat <<'TEXT'
+WeChat Agent Kit
+
+用法：
+  wechat-agent diagnose
+  wechat-agent sessions [wx 参数...]
+  wechat-agent history "群名或会话名" --since YYYY-MM-DD -n 5000 --json
+  wechat-agent search "关键词" [wx 参数...]
+  wechat-agent members "群名或会话名" [wx 参数...]
+  wechat-agent export "群名或会话名" [wx 参数...]
+  wechat-agent prompt
+
+默认优先调用 opencli wx；如果没有 opencli，则回退到 wx。
+TEXT
+}
+
+run_wx() {
+  if command -v opencli >/dev/null 2>&1; then
+    opencli wx "$@"
+  elif command -v wx >/dev/null 2>&1; then
+    wx "$@"
+  else
+    echo "缺少 opencli / wx，请先运行 install.sh。" >&2
+    exit 1
+  fi
+}
+
+cmd="${1:-}"
+case "$cmd" in
+  diagnose)
+    "$ROOT/verify.sh"
+    ;;
+  sessions)
+    shift
+    run_wx sessions "$@"
+    ;;
+  history)
+    shift
+    run_wx history "$@"
+    ;;
+  search)
+    shift
+    run_wx search "$@"
+    ;;
+  members)
+    shift
+    run_wx members "$@"
+    ;;
+  export)
+    shift
+    run_wx export "$@"
+    ;;
+  prompt)
+    cat "$ROOT/docs/agent-prompts.md"
+    ;;
+  ""|help|-h|--help)
+    usage
+    ;;
+  *)
+    echo "未知命令：$cmd" >&2
+    usage >&2
+    exit 2
+    ;;
+esac

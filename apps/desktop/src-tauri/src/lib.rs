@@ -1,4 +1,5 @@
 use chrono::Utc;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
@@ -6,6 +7,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
 };
+use tauri::{AppHandle, Emitter};
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -72,6 +74,26 @@ struct AskResponse {
     citations: Vec<Citation>,
 }
 
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct StreamPayload {
+    stream_id: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct StreamDeltaPayload {
+    stream_id: String,
+    delta: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct StreamErrorPayload {
+    stream_id: String,
+    message: String,
+}
+
 fn command_path(name: &str) -> Option<String> {
     let output = Command::new("/bin/zsh")
         .args(["-lc", &format!("command -v {}", shell_escape(name))])
@@ -95,6 +117,14 @@ fn shell_escape(input: &str) -> String {
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
         .collect()
+}
+
+fn shell_quote(input: &str) -> String {
+    format!("'{}'", input.replace('\'', "'\\''"))
+}
+
+fn applescript_string(input: &str) -> String {
+    input.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn run_command(program: &str, args: &[&str]) -> Result<CommandResult, String> {
@@ -235,15 +265,36 @@ fn run_wx_init() -> Result<CommandResult, String> {
         return Err("缺少 wx 命令，请先安装 wx-cli。".to_string());
     }
 
-    let script = r#"do shell script "wx init" with administrator privileges"#;
-    let result = run_command("osascript", &["-e", script])?;
-
     let wx_cli_dir = home_dir().join(".wx-cli");
-    if wx_cli_dir.exists() {
-        let _ = run_command(
-            "/bin/zsh",
-            &["-lc", "sudo chown -R $(id -un):$(id -gn) \"$HOME/.wx-cli\""],
-        );
+    let user = env::var("USER").unwrap_or_else(|_| "root".to_string());
+    let group = run_command("id", &["-gn"])
+        .ok()
+        .filter(|result| result.ok)
+        .map(|result| result.stdout.trim().to_string())
+        .filter(|group| !group.is_empty())
+        .unwrap_or_else(|| "staff".to_string());
+    let command = format!(
+        "wx init; if [ -d {dir} ]; then /usr/sbin/chown -R {user}:{group} {dir}; fi",
+        dir = shell_quote(&wx_cli_dir.display().to_string()),
+        user = shell_quote(&user),
+        group = shell_quote(&group),
+    );
+    let script = format!(
+        "do shell script \"{}\" with administrator privileges",
+        applescript_string(&command)
+    );
+    let result = run_command("osascript", &["-e", script.as_str()])?;
+    if !result.ok {
+        let message = if result.stderr.trim().is_empty() {
+            result.stdout.trim().to_string()
+        } else {
+            result.stderr.trim().to_string()
+        };
+        return Err(if message.is_empty() {
+            "初始化命令没有成功完成。".to_string()
+        } else {
+            message
+        });
     }
 
     Ok(result)
@@ -463,6 +514,150 @@ async fn ask_qwen(request: AskRequest) -> Result<AskResponse, String> {
     })
 }
 
+#[tauri::command]
+async fn ask_qwen_stream(
+    app: AppHandle,
+    request: AskRequest,
+    stream_id: String,
+) -> Result<AskResponse, String> {
+    let api_key = env::var("QWEN_API_KEY")
+        .or_else(|_| env::var("DASHSCOPE_API_KEY"))
+        .map_err(|_| "缺少 QWEN_API_KEY 或 DASHSCOPE_API_KEY。".to_string())?;
+    let base_url = env::var("QWEN_BASE_URL")
+        .unwrap_or_else(|_| "https://dashscope.aliyuncs.com/compatible-mode/v1".to_string());
+    let model = env::var("QWEN_MODEL").unwrap_or_else(|_| "qwen3.6-plus".to_string());
+    let context = match &request.context_file {
+        Some(file) => fs::read_to_string(file)
+            .map(|content| content.chars().take(32_000).collect::<String>())
+            .unwrap_or_else(|_| "未能读取本地导出文件。".to_string()),
+        None => "没有提供本地导出上下文。".to_string(),
+    };
+    let citations = request
+        .context_file
+        .clone()
+        .map(|file| {
+            vec![Citation {
+                label: "本地导出批次".to_string(),
+                source: file,
+            }]
+        })
+        .unwrap_or_default();
+
+    let body = json!({
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": "你是一个本机微信记录分析助手。只基于用户提供的本地上下文回答；如果上下文不足，明确说明不足。回答要简洁，并尽量给出可核对依据。"
+            },
+            {
+                "role": "user",
+                "content": format!("问题：{}\n\n本地微信上下文：\n{}", request.question, context)
+            }
+        ],
+        "temperature": 0.2,
+        "stream": true
+    });
+
+    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    let response = reqwest::Client::new()
+        .post(url)
+        .bearer_auth(api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|err| err.to_string())?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let value: serde_json::Value = response.json().await.map_err(|err| err.to_string())?;
+        let message = value.to_string();
+        let _ = app.emit(
+            "chat:error",
+            StreamErrorPayload {
+                stream_id,
+                message: message.clone(),
+            },
+        );
+        return Err(message);
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut buffer = String::new();
+    let mut answer = String::new();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                let message = err.to_string();
+                let _ = app.emit(
+                    "chat:error",
+                    StreamErrorPayload {
+                        stream_id,
+                        message: message.clone(),
+                    },
+                );
+                return Err(message);
+            }
+        };
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        buffer = buffer.replace("\r\n", "\n");
+
+        while let Some(index) = buffer.find("\n\n") {
+            let event = buffer[..index].to_string();
+            buffer = buffer[index + 2..].to_string();
+
+            for line in event.lines() {
+                let Some(data) = line.strip_prefix("data:") else {
+                    continue;
+                };
+                let data = data.trim();
+                if data == "[DONE]" {
+                    let _ = app.emit(
+                        "chat:done",
+                        StreamPayload {
+                            stream_id: stream_id.clone(),
+                        },
+                    );
+                    return Ok(AskResponse { answer, citations });
+                }
+
+                if let Some(delta) = stream_delta(data) {
+                    answer.push_str(&delta);
+                    let _ = app.emit(
+                        "chat:delta",
+                        StreamDeltaPayload {
+                            stream_id: stream_id.clone(),
+                            delta,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    let _ = app.emit(
+        "chat:done",
+        StreamPayload {
+            stream_id: stream_id.clone(),
+        },
+    );
+    Ok(AskResponse { answer, citations })
+}
+
+fn stream_delta(data: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(data).ok()?;
+    value
+        .get("choices")
+        .and_then(|choices| choices.get(0))
+        .and_then(|choice| choice.get("delta"))
+        .and_then(|delta| delta.get("content"))
+        .and_then(|content| content.as_str())
+        .filter(|content| !content.is_empty())
+        .map(ToString::to_string)
+}
+
 pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
@@ -472,7 +667,8 @@ pub fn run() {
             run_wx_init,
             list_sessions,
             export_history,
-            ask_qwen
+            ask_qwen,
+            ask_qwen_stream
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

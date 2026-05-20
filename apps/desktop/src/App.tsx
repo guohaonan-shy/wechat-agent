@@ -24,6 +24,7 @@ import {
   TriangleAlert,
   UserSearch,
   Users,
+  Wrench,
 } from "lucide-react";
 import { FormEvent, KeyboardEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
@@ -99,6 +100,30 @@ type ChatErrorPayload = {
   message: string;
 };
 
+type AgentStatusPayload = {
+  streamId: string;
+  message: string;
+};
+
+type AgentToolPayload = {
+  streamId: string;
+  tool: string;
+  label: string;
+  status: "running" | "done" | "error";
+  summary?: string;
+  input?: Record<string, unknown>;
+  citation?: Citation;
+};
+
+type AgentActivity = {
+  id: string;
+  kind: "status" | "tool";
+  label: string;
+  detail?: string;
+  status: "running" | "done" | "error";
+  tool?: string;
+};
+
 type ChatMessage = {
   id: string;
   role: "user" | "assistant";
@@ -106,6 +131,7 @@ type ChatMessage = {
   citations?: Citation[];
   pending?: boolean;
   thinkingStep?: string;
+  activities?: AgentActivity[];
 };
 
 type AgentChat = {
@@ -118,7 +144,7 @@ type AgentChat = {
 const MIN_STATUS_DELAY_MS = 650;
 const SETUP_CHECKING_DELAY_MS = 620;
 const SETUP_RESULT_DELAY_MS = 180;
-const SETUP_DEPENDENCY_KEYS = ["node", "npm", "wechat", "wx"];
+const SETUP_DEPENDENCY_KEYS = ["node", "npm", "wechat", "wx", "opencli"];
 const ONBOARDING_COMPLETE_KEY = "wechat-agent-onboarding-complete";
 
 async function call<T>(command: string, args?: Record<string, unknown>): Promise<T> {
@@ -238,14 +264,14 @@ function App() {
       let result = await call<DiagnoseResult>("diagnose_environment");
       await revealSetupChecks(result);
       setDiagnose(result);
-      const missingTools = result.checks.some((item) => item.key === "wx" && !item.ok);
+      const missingTools = result.checks.some((item) => ["wx", "opencli"].includes(item.key) && !item.ok);
 
       if (missingTools) {
         setSetupPhase("installing");
         setSetupLog("缺少本机读取工具，正在尝试自动安装");
         setSetupChecksState((prev) =>
           prev.map((check) =>
-            check.key === "wx"
+            ["wx", "opencli"].includes(check.key)
               ? { ...check, status: "checking", detail: "正在自动安装" }
               : check,
           ),
@@ -255,7 +281,7 @@ function App() {
         setSetupLog("正在重新验证本地依赖");
         setSetupChecksState((prev) =>
           prev.map((check) =>
-            check.key === "wx"
+            ["wx", "opencli"].includes(check.key)
               ? { ...check, status: "checking", detail: "正在安装后复查" }
               : check,
           ),
@@ -458,6 +484,15 @@ function App() {
           content: "",
           thinkingStep: "定位微信会话",
           pending: true,
+          activities: [
+            {
+              id: `${pendingId}_status_initial`,
+              kind: "status",
+              label: "理解问题",
+              detail: "准备选择本机微信工具",
+              status: "running",
+            },
+          ],
         },
       ],
     };
@@ -468,25 +503,15 @@ function App() {
   }
 
   async function answerQuestion(chatId: string, messageId: string, question: string) {
+    const streamId = `${chatId}:${messageId}:${Date.now()}`;
+    let streamed = false;
+    let unlistenDelta: (() => void) | undefined;
+    let unlistenError: (() => void) | undefined;
+    let unlistenStatus: (() => void) | undefined;
+    let unlistenTool: (() => void) | undefined;
+
     try {
-      const sessions = await call<SessionSummary[]>("list_sessions");
-      const resolution = resolveQuestionSession(question, sessions);
-
-      if (!resolution.session) {
-        replaceAssistant(chatId, messageId, sessionClarificationMessage(resolution.options), []);
-        return;
-      }
-
-      setAssistantThinking(chatId, messageId, `读取「${resolution.session.title}」聊天记录`);
-      const exported = await call<ExportResult>("export_history", {
-        session: resolution.session.id,
-        since: "2026-04-13",
-        limit: 5000,
-      });
-      setAssistantThinking(chatId, messageId, "组织本地上下文");
-      const streamId = `${chatId}:${messageId}:${Date.now()}`;
-      let streamed = false;
-      const unlistenDelta = await listen<ChatDeltaPayload>("chat:delta", (event) => {
+      unlistenDelta = await listen<ChatDeltaPayload>("chat:delta", (event) => {
         if (event.payload.streamId === streamId) {
           if (!streamed) {
             replaceAssistant(chatId, messageId, "", []);
@@ -495,34 +520,56 @@ function App() {
           appendAssistantDelta(chatId, messageId, event.payload.delta);
         }
       });
-      const unlistenError = await listen<ChatErrorPayload>("chat:error", (event) => {
+      unlistenError = await listen<ChatErrorPayload>("chat:error", (event) => {
         if (event.payload.streamId === streamId) {
+          appendAgentActivity(chatId, messageId, {
+            id: `${streamId}:error:${Date.now()}`,
+            kind: "status",
+            label: "调用失败",
+            detail: event.payload.message,
+            status: "error",
+          });
           replaceAssistant(chatId, messageId, event.payload.message, []);
         }
       });
-
-      try {
-        setAssistantThinking(chatId, messageId, "请求模型生成回答");
-        const response = await call<{ answer: string; citations: Citation[] }>("ask_qwen_stream", {
-          request: { question, contextFile: exported.file },
-          streamId,
-        });
-        if (!streamed && response.answer.trim()) {
-          replaceAssistant(chatId, messageId, response.answer, response.citations);
-          return;
+      unlistenStatus = await listen<AgentStatusPayload>("agent:status", (event) => {
+        if (event.payload.streamId === streamId) {
+          setAssistantThinking(chatId, messageId, event.payload.message);
+          appendAgentActivity(chatId, messageId, {
+            id: `${streamId}:status:${Date.now()}`,
+            kind: "status",
+            label: event.payload.message,
+            status: "running",
+          });
         }
-        finishAssistant(chatId, messageId, response.citations);
-      } finally {
-        unlistenDelta();
-        unlistenError();
+      });
+      unlistenTool = await listen<AgentToolPayload>("agent:tool", (event) => {
+        if (event.payload.streamId === streamId) {
+          upsertToolActivity(chatId, messageId, event.payload);
+        }
+      });
+
+      const response = await call<{ answer: string; citations: Citation[] }>("ask_agent_runtime", {
+        request: { question },
+        streamId,
+      });
+      if (!streamed && response.answer.trim()) {
+        replaceAssistant(chatId, messageId, response.answer, response.citations);
+        return;
       }
+      finishAssistant(chatId, messageId, response.citations);
     } catch (error) {
       replaceAssistant(
         chatId,
         messageId,
-        `已经收到问题，但本机 CLI 或 Qwen 调用还没有完成：${errorMessage(error)}\n\n你可以先检查 wx-cli 是否可用，以及是否设置了 QWEN_API_KEY。`,
+        `已经收到问题，但 agent runtime、wx-cli 或模型调用还没有完成：${errorMessage(error)}\n\n你可以先检查 wx-cli 是否可用、Node.js 是否为 22+，以及是否设置了 QWEN_API_KEY。`,
         [],
       );
+    } finally {
+      unlistenDelta?.();
+      unlistenError?.();
+      unlistenStatus?.();
+      unlistenTool?.();
     }
   }
 
@@ -638,6 +685,15 @@ function App() {
                   content: "",
                   thinkingStep: "结合上下文继续分析",
                   pending: true,
+                  activities: [
+                    {
+                      id: `${pendingId}_status_initial`,
+                      kind: "status",
+                      label: "继续分析",
+                      detail: "读取当前问题并准备调用工具",
+                      status: "running",
+                    },
+                  ],
                 },
               ],
               updatedAt: "刚刚",
@@ -676,6 +732,74 @@ function App() {
                   : message,
               ),
               updatedAt: "刚刚",
+            }
+          : chat,
+      ),
+    );
+  }
+
+  function appendAgentActivity(chatId: string, messageId: string, activity: AgentActivity) {
+    setChats((prev) =>
+      prev.map((chat) =>
+        chat.id === chatId
+          ? {
+              ...chat,
+              messages: chat.messages.map((message) =>
+                message.id === messageId
+                  ? {
+                      ...message,
+                      activities: [...(message.activities ?? []), activity],
+                    }
+                  : message,
+              ),
+            }
+          : chat,
+      ),
+    );
+  }
+
+  function upsertToolActivity(chatId: string, messageId: string, payload: AgentToolPayload) {
+    const detail = payload.summary ?? formatToolInput(payload.input);
+    setChats((prev) =>
+      prev.map((chat) =>
+        chat.id === chatId
+          ? {
+              ...chat,
+              messages: chat.messages.map((message) => {
+                if (message.id !== messageId) return message;
+                const activities = message.activities ?? [];
+                const existingIndex = [...activities].reverse().findIndex((activity) => activity.tool === payload.tool);
+                if (existingIndex === -1 || payload.status === "running") {
+                  return {
+                    ...message,
+                    activities: [
+                      ...activities,
+                      {
+                        id: `${messageId}:${payload.tool}:${Date.now()}`,
+                        kind: "tool",
+                        label: payload.label,
+                        detail,
+                        status: payload.status,
+                        tool: payload.tool,
+                      },
+                    ],
+                  };
+                }
+
+                const targetIndex = activities.length - 1 - existingIndex;
+                return {
+                  ...message,
+                  activities: activities.map((activity, index) =>
+                    index === targetIndex
+                      ? {
+                          ...activity,
+                          detail,
+                          status: payload.status,
+                        }
+                      : activity,
+                  ),
+                };
+              }),
             }
           : chat,
       ),
@@ -1352,6 +1476,16 @@ function ExistingChat({
   onClear: () => void;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
+  const bottomRef = useRef<HTMLDivElement | null>(null);
+  const scrollKey = chat.messages
+    .map((message) => `${message.id}:${message.content.length}:${message.pending ? "1" : "0"}:${message.activities?.length ?? 0}`)
+    .join("|");
+
+  useEffect(() => {
+    window.requestAnimationFrame(() => {
+      bottomRef.current?.scrollIntoView({ block: "end", behavior: "smooth" });
+    });
+  }, [scrollKey]);
 
   return (
     <div className="conversation">
@@ -1388,7 +1522,7 @@ function ExistingChat({
         {chat.messages.map((message) => (
           <article className={`message ${message.role} ${message.pending ? "pending" : ""}`} key={message.id}>
             {message.pending && message.thinkingStep ? (
-              <ThinkingCard step={message.thinkingStep} />
+              <ThinkingCard step={message.thinkingStep} activities={message.activities ?? []} />
             ) : message.role === "assistant" ? (
               <MarkdownContent content={message.content} />
             ) : (
@@ -1396,6 +1530,7 @@ function ExistingChat({
             )}
           </article>
         ))}
+        <div className="message-scroll-anchor" ref={bottomRef} />
       </div>
       <div className="conversation-composer">
         <ChatComposer placeholder="要求后续变更" input={input} setInput={setInput} onSubmit={onSubmit} compact />
@@ -1412,9 +1547,7 @@ function MarkdownContent({ content }: { content: string }) {
   );
 }
 
-function ThinkingCard({ step }: { step: string }) {
-  const stages = ["理解问题", "检索本地记录", "组织证据", "生成回答"];
-
+function ThinkingCard({ step, activities }: { step: string; activities: AgentActivity[] }) {
   return (
     <div className="thinking-card" aria-live="polite">
       <div className="thinking-card-header">
@@ -1425,13 +1558,39 @@ function ThinkingCard({ step }: { step: string }) {
         </span>
         <strong>{step}</strong>
       </div>
-      <div className="thinking-stage-row">
-        {stages.map((stage, index) => (
-          <span key={stage} style={{ animationDelay: `${index * 180}ms` }}>
-            {stage}
-          </span>
-        ))}
-      </div>
+      <AgentActivityList activities={activities} />
+    </div>
+  );
+}
+
+function AgentActivityList({ activities, compact = false }: { activities: AgentActivity[]; compact?: boolean }) {
+  if (activities.length === 0) return null;
+  const visible = activities.slice(-5);
+  return (
+    <div className={`agent-activity-list ${compact ? "compact" : ""}`}>
+      {visible.map((activity) => (
+        <div className={`agent-activity-row ${activity.status}`} key={activity.id}>
+          <div className="agent-activity-icon">
+            {activity.kind === "tool" ? (
+              activity.status === "running" ? (
+                <LoaderCircle className="spin" size={13} />
+              ) : (
+                <Wrench size={13} />
+              )
+            ) : activity.status === "error" ? (
+              <TriangleAlert size={13} />
+            ) : activity.status === "done" ? (
+              <Check size={13} />
+            ) : (
+              <span />
+            )}
+          </div>
+          <div>
+            <strong>{activity.label}</strong>
+            {activity.detail ? <span>{activity.detail}</span> : null}
+          </div>
+        </div>
+      ))}
     </div>
   );
 }
@@ -1487,6 +1646,24 @@ function errorMessage(error: unknown) {
   return JSON.stringify(error);
 }
 
+function formatToolInput(input: Record<string, unknown> | undefined) {
+  if (!input) return undefined;
+  const entries = Object.entries(input)
+    .filter(([, value]) => value !== undefined && value !== "")
+    .map(([key, value]) => `${toolInputLabel(key)}：${String(value)}`);
+  return entries.length > 0 ? entries.join(" · ") : undefined;
+}
+
+function toolInputLabel(key: string) {
+  const labels: Record<string, string> = {
+    session: "会话",
+    since: "起始",
+    limit: "数量",
+    keyword: "关键词",
+  };
+  return labels[key] ?? key;
+}
+
 function setupEnvironmentReady(diagnose: DiagnoseResult) {
   const checkByKey = new Map(diagnose.checks.map((check) => [check.key, check]));
   return SETUP_DEPENDENCY_KEYS.every((key) => checkByKey.get(key)?.ok);
@@ -1529,12 +1706,14 @@ function setupChecks(diagnose: DiagnoseResult | null, phase: SetupPhase, setupLo
     npm: "准备安装能力",
     wechat: "找到 Mac 微信",
     wx: "准备微信读取能力",
+    opencli: "准备 agent 调用入口",
   };
   const details: Record<string, string> = {
     node: "用于在本机运行微信助手",
     npm: "用于自动准备缺少的组件",
     wechat: "确认这台 Mac 已安装微信",
     wx: "让 App 能读取本机微信记录",
+    opencli: "让本机工具更适合 agent 调用",
   };
 
   if (!diagnose) {
@@ -1556,7 +1735,7 @@ function setupChecks(diagnose: DiagnoseResult | null, phase: SetupPhase, setupLo
 
     if (!check) {
       status = "pending";
-    } else if (phase === "installing" && key === "wx" && !check.ok) {
+    } else if (phase === "installing" && ["wx", "opencli"].includes(key) && !check.ok) {
       status = "checking";
     } else if (activeIndex === index && !check.ok) {
       status = "checking";

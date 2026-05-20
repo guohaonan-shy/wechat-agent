@@ -5,9 +5,13 @@ use serde_json::json;
 use std::{
     env, fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
 };
 use tauri::{AppHandle, Emitter};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    process::Command as TokioCommand,
+};
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -61,14 +65,14 @@ struct ExportResult {
     bytes: usize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AskRequest {
     question: String,
     context_file: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct Citation {
     label: String,
@@ -100,6 +104,25 @@ struct StreamDeltaPayload {
 struct StreamErrorPayload {
     stream_id: String,
     message: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AgentStatusPayload {
+    stream_id: String,
+    message: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AgentToolPayload {
+    stream_id: String,
+    tool: String,
+    label: String,
+    status: String,
+    summary: Option<String>,
+    input: Option<serde_json::Value>,
+    citation: Option<Citation>,
 }
 
 fn command_path(name: &str) -> Option<String> {
@@ -174,11 +197,27 @@ fn wx_cli_dir() -> PathBuf {
     home_dir().join(".wx-cli")
 }
 
+fn wx_command_args<'a>(args: &'a [&'a str]) -> Vec<&'a str> {
+    let mut command_args = Vec::with_capacity(args.len() + 1);
+    command_args.push("wx");
+    command_args.extend_from_slice(args);
+    command_args
+}
+
 fn run_wx_command(args: &[&str]) -> Result<CommandResult, String> {
-    let program = command_path("wx").ok_or_else(|| "缺少 wx，请先安装 wx-cli。".to_string())?;
     let dir = wx_cli_dir();
     fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
-    run_command_in_dir(&program, args, &dir)
+
+    if let Some(program) = command_path("opencli") {
+        let command_args = wx_command_args(args);
+        return run_command_in_dir(&program, &command_args, &dir);
+    }
+
+    if let Some(program) = command_path("wx") {
+        return run_command_in_dir(&program, args, &dir);
+    }
+
+    Err("缺少 opencli / wx，请先安装本机微信读取工具。".to_string())
 }
 
 #[tauri::command]
@@ -205,6 +244,7 @@ fn diagnose_environment() -> DiagnoseResult {
             detail: "/Applications/WeChat.app".to_string(),
         },
         cmd_check("wx", "wx-cli"),
+        cmd_check("opencli", "opencli"),
         CheckItem {
             key: "wxCliDir".to_string(),
             label: "~/.wx-cli".to_string(),
@@ -468,7 +508,10 @@ fn check_local_init_status() -> InitCheckResult {
 
 #[tauri::command]
 fn install_cli_tools() -> Result<CommandResult, String> {
-    run_command("npm", &["install", "-g", "@jackwener/wx-cli"])
+    run_command(
+        "npm",
+        &["install", "-g", "@jackwener/opencli", "@jackwener/wx-cli"],
+    )
 }
 
 #[tauri::command]
@@ -984,6 +1027,249 @@ fn stream_delta(data: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn desktop_app_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn agent_runtime_command(app_dir: &Path) -> (PathBuf, Vec<String>) {
+    let local_tsx = app_dir.join("node_modules/.bin/tsx");
+    if local_tsx.exists() {
+        (local_tsx, vec!["agent-runtime/wechat-agent.ts".to_string()])
+    } else {
+        (
+            PathBuf::from("npx"),
+            vec![
+                "tsx".to_string(),
+                "--".to_string(),
+                "agent-runtime/wechat-agent.ts".to_string(),
+            ],
+        )
+    }
+}
+
+#[tauri::command]
+async fn ask_agent_runtime(
+    app: AppHandle,
+    request: AskRequest,
+    stream_id: String,
+) -> Result<AskResponse, String> {
+    let app_dir = desktop_app_dir();
+    let (program, args) = agent_runtime_command(&app_dir);
+    let mut child = TokioCommand::new(program)
+        .args(args)
+        .current_dir(&app_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("启动 agent runtime 失败：{err}"))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        let payload = serde_json::to_vec(&request).map_err(|err| err.to_string())?;
+        stdin
+            .write_all(&payload)
+            .await
+            .map_err(|err| format!("写入 agent 请求失败：{err}"))?;
+    }
+
+    let stderr = child.stderr.take();
+    let stderr_task = stderr.map(|stderr| {
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr).lines();
+            let mut lines = Vec::new();
+            while let Ok(Some(line)) = reader.next_line().await {
+                if !line.trim().is_empty() {
+                    lines.push(line);
+                }
+            }
+            lines.join("\n")
+        })
+    });
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "agent runtime stdout 不可用。".to_string())?;
+    let mut reader = BufReader::new(stdout).lines();
+    let mut answer = String::new();
+    let mut citations: Vec<Citation> = Vec::new();
+
+    while let Some(line) = reader.next_line().await.map_err(|err| err.to_string())? {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let event_type = event
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+
+        match event_type {
+            "status" => {
+                let message = event
+                    .get("message")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("Agent 正在处理")
+                    .to_string();
+                let _ = app.emit(
+                    "agent:status",
+                    AgentStatusPayload {
+                        stream_id: stream_id.clone(),
+                        message,
+                    },
+                );
+            }
+            "tool_start" | "tool_done" => {
+                let tool = event
+                    .get("tool")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("tool")
+                    .to_string();
+                let label = event
+                    .get("label")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(&tool)
+                    .to_string();
+                let summary = event
+                    .get("summary")
+                    .and_then(|value| value.as_str())
+                    .map(ToString::to_string);
+                let input = event.get("input").cloned();
+                let citation = event
+                    .get("citation")
+                    .and_then(|value| serde_json::from_value::<Citation>(value.clone()).ok());
+                if let Some(citation) = citation.clone() {
+                    citations.push(citation);
+                }
+                let _ = app.emit(
+                    "agent:tool",
+                    AgentToolPayload {
+                        stream_id: stream_id.clone(),
+                        tool,
+                        label,
+                        status: if event_type == "tool_start" {
+                            "running".to_string()
+                        } else {
+                            "done".to_string()
+                        },
+                        summary,
+                        input,
+                        citation,
+                    },
+                );
+            }
+            "delta" => {
+                if let Some(delta) = event.get("delta").and_then(|value| value.as_str()) {
+                    answer.push_str(delta);
+                    let _ = app.emit(
+                        "chat:delta",
+                        StreamDeltaPayload {
+                            stream_id: stream_id.clone(),
+                            delta: delta.to_string(),
+                        },
+                    );
+                }
+            }
+            "done" => {
+                if answer.trim().is_empty() {
+                    answer = event
+                        .get("answer")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                }
+                if let Some(event_citations) =
+                    event.get("citations").and_then(|value| value.as_array())
+                {
+                    citations = event_citations
+                        .iter()
+                        .filter_map(|value| serde_json::from_value::<Citation>(value.clone()).ok())
+                        .collect();
+                }
+            }
+            "error" => {
+                let message = event
+                    .get("message")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("Agent runtime 调用失败。")
+                    .to_string();
+                let _ = app.emit(
+                    "chat:error",
+                    StreamErrorPayload {
+                        stream_id: stream_id.clone(),
+                        message: message.clone(),
+                    },
+                );
+                return Err(message);
+            }
+            _ => {}
+        }
+    }
+
+    let status = child.wait().await.map_err(|err| err.to_string())?;
+    if !status.success() {
+        let stderr = match stderr_task {
+            Some(task) => task.await.unwrap_or_default(),
+            None => String::new(),
+        };
+        let message = if stderr.trim().is_empty() {
+            format!("Agent runtime 退出失败：{status}")
+        } else {
+            stderr
+        };
+        let _ = app.emit(
+            "chat:error",
+            StreamErrorPayload {
+                stream_id,
+                message: message.clone(),
+            },
+        );
+        return Err(message);
+    }
+
+    let _ = app.emit(
+        "chat:done",
+        StreamPayload {
+            stream_id: stream_id.clone(),
+        },
+    );
+    Ok(AskResponse { answer, citations })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wx_command_args_prefixes_opencli_namespace() {
+        let args = wx_command_args(&["sessions", "-n", "1"]);
+        assert_eq!(args, vec!["wx", "sessions", "-n", "1"]);
+    }
+
+    #[test]
+    fn parse_sessions_reads_nested_titles() {
+        let sessions = parse_sessions(
+            r#"{"sessions":[{"username":"room_1","conversation":{"displayName":"产品讨论群"}}]}"#,
+        );
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "room_1");
+        assert_eq!(sessions[0].title, "产品讨论群");
+    }
+
+    #[test]
+    fn stream_delta_reads_openai_style_delta() {
+        let delta = stream_delta(r#"{"choices":[{"delta":{"content":"你好"}}]}"#);
+        assert_eq!(delta.as_deref(), Some("你好"));
+    }
+}
+
 pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
@@ -995,7 +1281,8 @@ pub fn run() {
             list_sessions,
             export_history,
             ask_qwen,
-            ask_qwen_stream
+            ask_qwen_stream,
+            ask_agent_runtime
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

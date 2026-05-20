@@ -27,6 +27,14 @@ struct DiagnoseResult {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct InitCheckResult {
+    config_ready: bool,
+    query_ready: bool,
+    detail: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct CommandResult {
     ok: bool,
     status: i32,
@@ -141,16 +149,19 @@ fn run_command(program: &str, args: &[&str]) -> Result<CommandResult, String> {
     })
 }
 
-fn wx_runner_args<'a>(args: &'a [&'a str]) -> Result<(String, Vec<&'a str>), String> {
-    if command_path("opencli").is_some() {
-        let mut full_args = vec!["wx"];
-        full_args.extend_from_slice(args);
-        Ok(("opencli".to_string(), full_args))
-    } else if command_path("wx").is_some() {
-        Ok(("wx".to_string(), args.to_vec()))
-    } else {
-        Err("缺少 opencli / wx，请先安装本地工具。".to_string())
-    }
+fn run_command_in_dir(program: &str, args: &[&str], dir: &Path) -> Result<CommandResult, String> {
+    let output = Command::new(program)
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .map_err(|err| format!("failed to run {program}: {err}"))?;
+
+    Ok(CommandResult {
+        ok: output.status.success(),
+        status: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
 }
 
 fn home_dir() -> PathBuf {
@@ -159,10 +170,21 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp"))
 }
 
+fn wx_cli_dir() -> PathBuf {
+    home_dir().join(".wx-cli")
+}
+
+fn run_wx_command(args: &[&str]) -> Result<CommandResult, String> {
+    let program = command_path("wx").ok_or_else(|| "缺少 wx，请先安装 wx-cli。".to_string())?;
+    let dir = wx_cli_dir();
+    fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+    run_command_in_dir(&program, args, &dir)
+}
+
 #[tauri::command]
 fn diagnose_environment() -> DiagnoseResult {
     let wechat_app = Path::new("/Applications/WeChat.app");
-    let wx_cli_dir = home_dir().join(".wx-cli");
+    let wx_cli_dir = wx_cli_dir();
     let checks = vec![
         CheckItem {
             key: "macos".to_string(),
@@ -183,7 +205,6 @@ fn diagnose_environment() -> DiagnoseResult {
             detail: "/Applications/WeChat.app".to_string(),
         },
         cmd_check("wx", "wx-cli"),
-        cmd_check("opencli", "opencli"),
         CheckItem {
             key: "wxCliDir".to_string(),
             label: "~/.wx-cli".to_string(),
@@ -214,16 +235,17 @@ fn cmd_check(cmd: &str, label: &str) -> CheckItem {
 }
 
 fn wechat_data_access_check() -> CheckItem {
-    let home = home_dir();
-    let candidates = [
-        home.join(
-            "Library/Containers/com.tencent.xinWeChat/Data/Library/Application Support/com.tencent.xinWeChat",
-        ),
-        home.join("Library/Containers/com.tencent.xinWeChat/Data/Documents"),
-        home.join("Library/Application Support/com.tencent.xinWeChat"),
-        home.join("Library/Containers/com.tencent.xinWeChat"),
-    ];
+    if let Some(path) = detect_wechat_db_dir() {
+        return CheckItem {
+            key: "wechatDataAccess".to_string(),
+            label: "微信数据访问".to_string(),
+            ok: true,
+            detail: path.display().to_string(),
+        };
+    }
 
+    let home = home_dir();
+    let candidates = wechat_data_roots(&home);
     for path in candidates.iter().filter(|path| path.exists()) {
         if fs::read_dir(path).is_ok() {
             return CheckItem {
@@ -243,12 +265,210 @@ fn wechat_data_access_check() -> CheckItem {
     }
 }
 
+fn wechat_data_roots(home: &Path) -> Vec<PathBuf> {
+    vec![
+        home.join("Library/Containers/com.tencent.xinWeChat/Data/Documents"),
+        home.join(
+            "Library/Containers/com.tencent.xinWeChat/Data/Library/Application Support/com.tencent.xinWeChat",
+        ),
+        home.join("Library/Application Support/com.tencent.xinWeChat"),
+        home.join("Library/Containers/com.tencent.xinWeChat"),
+    ]
+}
+
+fn detect_wechat_db_dir() -> Option<PathBuf> {
+    let home = home_dir();
+    let xwechat_files =
+        home.join("Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files");
+
+    find_db_storage_under(&xwechat_files, 2).or_else(|| {
+        wechat_data_roots(&home)
+            .into_iter()
+            .filter_map(|root| find_db_storage_under(&root, 4))
+            .next()
+    })
+}
+
+fn find_db_storage_under(root: &Path, max_depth: usize) -> Option<PathBuf> {
+    if !root.exists() || max_depth == 0 {
+        return None;
+    }
+
+    let mut best: Option<(PathBuf, u64)> = None;
+    collect_db_storage_dirs(root, max_depth, &mut best);
+    best.map(|(path, _)| path)
+}
+
+fn collect_db_storage_dirs(root: &Path, depth_left: usize, best: &mut Option<(PathBuf, u64)>) {
+    if depth_left == 0 {
+        return;
+    }
+
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        if path.file_name().and_then(|name| name.to_str()) == Some("db_storage") {
+            let modified = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .map(|elapsed| u64::MAX - elapsed.as_secs())
+                .unwrap_or(0);
+
+            match best {
+                Some((_, current_modified)) if *current_modified >= modified => {}
+                _ => *best = Some((path, modified)),
+            }
+            continue;
+        }
+
+        collect_db_storage_dirs(&path, depth_left - 1, best);
+    }
+}
+
+fn tail_non_empty_lines(path: &Path, limit: usize) -> String {
+    fs::read_to_string(path)
+        .ok()
+        .map(|content| {
+            let mut lines: Vec<_> = content
+                .lines()
+                .map(str::trim)
+                .map(sanitize_terminal_line)
+                .filter(|line| !line.is_empty())
+                .collect();
+            let keep_from = lines.len().saturating_sub(limit);
+            lines.drain(0..keep_from);
+            lines.join("\n")
+        })
+        .filter(|content| !content.is_empty())
+        .unwrap_or_default()
+}
+
+fn sanitize_terminal_line(line: &str) -> String {
+    let mut output = String::new();
+    let mut chars = line.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            match chars.peek().copied() {
+                Some('[') => {
+                    chars.next();
+                    while let Some(next) = chars.next() {
+                        if ('@'..='~').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    while let Some(next) = chars.next() {
+                        if next == '\u{7}' {
+                            break;
+                        }
+                        if next == '\u{1b}' && chars.peek().copied() == Some('\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            }
+            continue;
+        }
+
+        if !ch.is_control() {
+            output.push(ch);
+        }
+    }
+
+    output.trim().to_string()
+}
+
+#[tauri::command]
+fn check_local_init_status() -> InitCheckResult {
+    let wx_cli_dir = wx_cli_dir();
+    let config_path = wx_cli_dir.join("config.json");
+    let keys_path = wx_cli_dir.join("all_keys.json");
+    let init_log_path = wx_cli_dir.join("init.log");
+
+    if !wx_cli_dir.exists() {
+        return InitCheckResult {
+            config_ready: false,
+            query_ready: false,
+            detail: format!("尚未创建 {}，需要执行一次初始化。", wx_cli_dir.display()),
+        };
+    }
+
+    if !config_path.exists() {
+        return InitCheckResult {
+            config_ready: false,
+            query_ready: false,
+            detail: "尚未写入微信数据目录配置，需要执行一次初始化。".to_string(),
+        };
+    }
+
+    if !keys_path.exists() {
+        let init_log = tail_non_empty_lines(&init_log_path, 5);
+        let detail = if init_log.is_empty() {
+            "尚未生成 all_keys.json。请在 Terminal 中确认 sudo wx init 已成功完成；如果失败，请按 Terminal 里的 wx-cli 错误处理后重新初始化。".to_string()
+        } else {
+            format!(
+                "尚未生成 all_keys.json。最近初始化日志已记录，可展开查看。[[INIT_LOG]]{}",
+                init_log
+            )
+        };
+        return InitCheckResult {
+            config_ready: false,
+            query_ready: false,
+            detail,
+        };
+    }
+
+    match run_wx_command(&["sessions", "-n", "1", "--json"]) {
+        Ok(result) if result.ok => InitCheckResult {
+            config_ready: true,
+            query_ready: true,
+            detail: "已检测到可用的本机微信读取能力。".to_string(),
+        },
+        Ok(result) => {
+            let detail = if result.stderr.trim().is_empty() {
+                result.stdout.trim().to_string()
+            } else {
+                result.stderr.trim().to_string()
+            };
+            InitCheckResult {
+                config_ready: true,
+                query_ready: false,
+                detail: if detail.is_empty() {
+                    "本机配置已存在，但微信会话读取检查没有通过。".to_string()
+                } else {
+                    detail
+                },
+            }
+        }
+        Err(message) => InitCheckResult {
+            config_ready: true,
+            query_ready: false,
+            detail: message,
+        },
+    }
+}
+
 #[tauri::command]
 fn install_cli_tools() -> Result<CommandResult, String> {
-    run_command(
-        "npm",
-        &["install", "-g", "@jackwener/opencli", "@jackwener/wx-cli"],
-    )
+    run_command("npm", &["install", "-g", "@jackwener/wx-cli"])
 }
 
 #[tauri::command]
@@ -261,27 +481,87 @@ fn open_full_disk_access_settings() -> Result<CommandResult, String> {
 
 #[tauri::command]
 fn run_wx_init() -> Result<CommandResult, String> {
-    if command_path("wx").is_none() {
-        return Err("缺少 wx 命令，请先安装 wx-cli。".to_string());
-    }
+    let wx_path =
+        command_path("wx").ok_or_else(|| "缺少 wx 命令，请先安装 wx-cli。".to_string())?;
+    let wx_cli_dir = wx_cli_dir();
+    let init_log_path = wx_cli_dir.join("init.log");
+    let init_script_path = wx_cli_dir.join("init.sh");
 
-    let wx_cli_dir = home_dir().join(".wx-cli");
-    let user = env::var("USER").unwrap_or_else(|_| "root".to_string());
-    let group = run_command("id", &["-gn"])
-        .ok()
-        .filter(|result| result.ok)
-        .map(|result| result.stdout.trim().to_string())
-        .filter(|group| !group.is_empty())
-        .unwrap_or_else(|| "staff".to_string());
-    let command = format!(
-        "wx init; if [ -d {dir} ]; then /usr/sbin/chown -R {user}:{group} {dir}; fi",
+    fs::create_dir_all(&wx_cli_dir)
+        .map_err(|err| format!("创建 {} 失败：{err}", wx_cli_dir.display()))?;
+
+    let init_script = format!(
+        r#"#!/bin/zsh
+cd {dir}
+LOG={log}
+: > "$LOG"
+exec > >(tee -a "$LOG") 2>&1
+clear
+OWNER_USER=$(id -un)
+OWNER_GROUP=$(id -gn)
+echo "微信助手正在按 wx-cli 官方推荐流程初始化。"
+echo
+echo "1/5 重签名 WeChat，允许 wx-cli 扫描本机微信内存。"
+if ! sudo codesign --force --deep --sign - /Applications/WeChat.app; then
+  sudo codesign --remove-signature "/Applications/WeChat.app/Contents/Frameworks/vlc_plugins/librtp_mpeg4_plugin.dylib" || true
+  sudo codesign --force --deep --sign - /Applications/WeChat.app
+fi
+
+echo
+echo "2/5 重置 WeChat 的旧 macOS 隐私授权记录。"
+for service in ScreenCapture Camera Microphone AppleEvents AddressBook SystemPolicyDocumentsFolder SystemPolicyDownloadsFolder SystemPolicyDesktopFolder; do
+  tccutil reset "$service" com.tencent.xinWeChat >/dev/null 2>&1 || true
+done
+
+echo
+echo "3/5 重启 WeChat。请等待微信完全登录。"
+killall WeChat >/dev/null 2>&1 || true
+open /Applications/WeChat.app
+echo
+echo "微信完全登录后，在这个 Terminal 窗口按回车继续。"
+read _
+
+echo
+echo "4/5 执行 sudo wx init，并修复本机配置权限。"
+sudo {wx} init
+INIT_STATUS=$?
+echo
+echo "修复 ~/.wx-cli 文件权限，确保后续 App 可直接读取。"
+sudo /usr/sbin/chown -R "$OWNER_USER:$OWNER_GROUP" {dir}
+if [ "$INIT_STATUS" -ne 0 ]; then
+  echo
+  echo "wx init 未成功完成。请根据上方错误处理后，再回到微信助手重新开始初始化。"
+  exit "$INIT_STATUS"
+fi
+
+echo
+echo "5/5 验证 wx sessions。"
+{wx} daemon stop >/dev/null 2>&1 || true
+{wx} sessions -n 1
+VERIFY_STATUS=$?
+echo
+if [ "$VERIFY_STATUS" -eq 0 ]; then
+  echo "初始化和权限修复已完成。请回到微信助手点击重新检查。"
+else
+  echo "wx sessions 验证失败。请把上方错误发给开发者，或重新开始初始化。"
+fi
+exit "$VERIFY_STATUS"
+"#,
         dir = shell_quote(&wx_cli_dir.display().to_string()),
-        user = shell_quote(&user),
-        group = shell_quote(&group),
+        log = shell_quote(&init_log_path.display().to_string()),
+        wx = shell_quote(&wx_path),
     );
+    fs::write(&init_script_path, init_script)
+        .map_err(|err| format!("写入 {} 失败：{err}", init_script_path.display()))?;
+    run_command(
+        "chmod",
+        &["+x", init_script_path.to_string_lossy().as_ref()],
+    )?;
+
+    let terminal_script = format!("{}", shell_quote(&init_script_path.display().to_string()));
     let script = format!(
-        "do shell script \"{}\" with administrator privileges",
-        applescript_string(&command)
+        "tell application \"Terminal\"\nactivate\ndo script \"{}\"\nend tell",
+        applescript_string(&terminal_script)
     );
     let result = run_command("osascript", &["-e", script.as_str()])?;
     if !result.ok {
@@ -302,8 +582,7 @@ fn run_wx_init() -> Result<CommandResult, String> {
 
 #[tauri::command]
 fn list_sessions() -> Result<Vec<SessionSummary>, String> {
-    let (program, args) = wx_runner_args(&["sessions", "-n", "20", "--json"])?;
-    let result = run_command(&program, &args)?;
+    let result = run_wx_command(&["sessions", "-n", "20", "--json"])?;
     if !result.ok {
         return Err(result.stderr.trim().to_string());
     }
@@ -332,6 +611,7 @@ fn parse_sessions(output: &str) -> Vec<SessionSummary> {
                     item,
                     &[
                         "name",
+                        "chat",
                         "title",
                         "remark",
                         "displayName",
@@ -355,7 +635,7 @@ fn parse_sessions(output: &str) -> Vec<SessionSummary> {
                 SessionSummary {
                     id,
                     title,
-                    subtitle: "来自 opencli wx sessions".to_string(),
+                    subtitle: "来自 wx sessions".to_string(),
                 }
             })
             .collect();
@@ -417,8 +697,7 @@ fn export_history(session: String, since: String, limit: u32) -> Result<ExportRe
     let history_args = [
         "history", &session, "--since", &since, "-n", &limit, "--json",
     ];
-    let (program, args) = wx_runner_args(&history_args)?;
-    let result = run_command(&program, &args)?;
+    let result = run_wx_command(&history_args)?;
     if !result.ok {
         return Err(result.stderr.trim().to_string());
     }
@@ -446,6 +725,63 @@ fn export_history(session: String, since: String, limit: u32) -> Result<ExportRe
     })
 }
 
+fn read_llm_context(context_file: &Option<String>) -> String {
+    match context_file {
+        Some(file) => fs::read_to_string(file)
+            .map(|content| build_llm_context(&content))
+            .unwrap_or_else(|_| "未能读取本地导出文件。".to_string()),
+        None => "没有提供本地聊天摘录。".to_string(),
+    }
+}
+
+fn build_llm_context(raw: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return raw.chars().take(32_000).collect();
+    };
+
+    let chat = value
+        .get("chat")
+        .and_then(|field| field.as_str())
+        .unwrap_or("当前会话");
+    let mut lines = vec![format!("会话：{chat}")];
+
+    if let Some(messages) = value.get("messages").and_then(|field| field.as_array()) {
+        for item in messages.iter().take(900) {
+            let time = item
+                .get("time")
+                .and_then(|field| field.as_str())
+                .unwrap_or("未知时间");
+            let sender = item
+                .get("sender")
+                .and_then(|field| field.as_str())
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("未知发送者");
+            let content = item
+                .get("content")
+                .and_then(|field| field.as_str())
+                .or_else(|| item.get("summary").and_then(|field| field.as_str()))
+                .unwrap_or("")
+                .trim();
+            let message_type = item
+                .get("type")
+                .and_then(|field| field.as_str())
+                .unwrap_or("消息");
+
+            if content.is_empty() {
+                continue;
+            }
+
+            lines.push(format!("[{time}] {sender}（{message_type}）：{content}"));
+        }
+    }
+
+    lines.join("\n").chars().take(32_000).collect()
+}
+
+fn qwen_system_prompt() -> &'static str {
+    "你是一个本机微信记录分析助手。请基于提供的聊天摘录回答用户问题，回答要简洁、具体，并尽量引用可核对的消息内容或发送人表达作为依据。不要提及 JSON、系统设定、上下文片段、内部记录、消息 ID、local_id、username、chatroom id 或文件路径；如果需要指代消息，用发送人、时间和消息内容概括替代。若当前可见聊天记录不足以支持结论，请自然说明“当前可见聊天记录不足以判断”，不要说“受限于系统设定”。"
+}
+
 #[tauri::command]
 async fn ask_qwen(request: AskRequest) -> Result<AskResponse, String> {
     let api_key = env::var("QWEN_API_KEY")
@@ -454,23 +790,18 @@ async fn ask_qwen(request: AskRequest) -> Result<AskResponse, String> {
     let base_url = env::var("QWEN_BASE_URL")
         .unwrap_or_else(|_| "https://dashscope.aliyuncs.com/compatible-mode/v1".to_string());
     let model = env::var("QWEN_MODEL").unwrap_or_else(|_| "qwen3.6-plus".to_string());
-    let context = match &request.context_file {
-        Some(file) => fs::read_to_string(file)
-            .map(|content| content.chars().take(32_000).collect::<String>())
-            .unwrap_or_else(|_| "未能读取本地导出文件。".to_string()),
-        None => "没有提供本地导出上下文。".to_string(),
-    };
+    let context = read_llm_context(&request.context_file);
 
     let body = json!({
         "model": model,
         "messages": [
             {
                 "role": "system",
-                "content": "你是一个本机微信记录分析助手。只基于用户提供的本地上下文回答；如果上下文不足，明确说明不足。回答要简洁，并尽量给出可核对依据。"
+                "content": qwen_system_prompt()
             },
             {
                 "role": "user",
-                "content": format!("问题：{}\n\n本地微信上下文：\n{}", request.question, context)
+                "content": format!("问题：{}\n\n本地聊天摘录：\n{}", request.question, context)
             }
         ],
         "temperature": 0.2
@@ -526,12 +857,7 @@ async fn ask_qwen_stream(
     let base_url = env::var("QWEN_BASE_URL")
         .unwrap_or_else(|_| "https://dashscope.aliyuncs.com/compatible-mode/v1".to_string());
     let model = env::var("QWEN_MODEL").unwrap_or_else(|_| "qwen3.6-plus".to_string());
-    let context = match &request.context_file {
-        Some(file) => fs::read_to_string(file)
-            .map(|content| content.chars().take(32_000).collect::<String>())
-            .unwrap_or_else(|_| "未能读取本地导出文件。".to_string()),
-        None => "没有提供本地导出上下文。".to_string(),
-    };
+    let context = read_llm_context(&request.context_file);
     let citations = request
         .context_file
         .clone()
@@ -548,11 +874,11 @@ async fn ask_qwen_stream(
         "messages": [
             {
                 "role": "system",
-                "content": "你是一个本机微信记录分析助手。只基于用户提供的本地上下文回答；如果上下文不足，明确说明不足。回答要简洁，并尽量给出可核对依据。"
+                "content": qwen_system_prompt()
             },
             {
                 "role": "user",
-                "content": format!("问题：{}\n\n本地微信上下文：\n{}", request.question, context)
+                "content": format!("问题：{}\n\n本地聊天摘录：\n{}", request.question, context)
             }
         ],
         "temperature": 0.2,
@@ -662,6 +988,7 @@ pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             diagnose_environment,
+            check_local_init_status,
             install_cli_tools,
             open_full_disk_access_settings,
             run_wx_init,

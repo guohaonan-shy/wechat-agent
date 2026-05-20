@@ -26,13 +26,16 @@ import {
   Users,
 } from "lucide-react";
 import { FormEvent, KeyboardEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 type OnboardingStep = "welcome" | "setup" | "permission" | "confirm" | "ready";
 type View = "onboarding" | "home" | "chat";
 type SetupPhase = "idle" | "checking" | "installing" | "verifying" | "ready" | "needsAttention" | "error";
 type SetupCheckStatus = "pending" | "checking" | "ready" | "blocked";
 type PermissionStatus = "idle" | "checking" | "granted" | "blocked" | "error";
-type InitStatus = "idle" | "checking" | "ready" | "needsInit" | "initializing" | "error";
+type InitStatus = "idle" | "checking" | "ready" | "needsInit" | "initializing" | "waitingExternal" | "error";
+type InitProgressStatus = "pending" | "checking" | "ready" | "blocked";
 
 type CheckItem = {
   key: string;
@@ -46,11 +49,24 @@ type DiagnoseResult = {
   checks: CheckItem[];
 };
 
+type InitCheckResult = {
+  configReady: boolean;
+  queryReady: boolean;
+  detail: string;
+};
+
 type SetupCheck = {
   key: string;
   label: string;
   detail: string;
   status: SetupCheckStatus;
+};
+
+type InitProgressStep = {
+  key: "config" | "query" | "finish";
+  label: string;
+  detail: string;
+  status: InitProgressStatus;
 };
 
 type SessionSummary = {
@@ -89,6 +105,7 @@ type ChatMessage = {
   content: string;
   citations?: Citation[];
   pending?: boolean;
+  thinkingStep?: string;
 };
 
 type AgentChat = {
@@ -98,17 +115,11 @@ type AgentChat = {
   messages: ChatMessage[];
 };
 
-const fallbackSessions: SessionSummary[] = [
-  {
-    id: "demo-product",
-    title: "产品讨论群",
-    subtitle: "Demo fallback",
-  },
-];
-
 const MIN_STATUS_DELAY_MS = 650;
 const SETUP_CHECKING_DELAY_MS = 620;
 const SETUP_RESULT_DELAY_MS = 180;
+const SETUP_DEPENDENCY_KEYS = ["node", "npm", "wechat", "wx"];
+const ONBOARDING_COMPLETE_KEY = "wechat-agent-onboarding-complete";
 
 async function call<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   return invoke<T>(command, args);
@@ -126,7 +137,9 @@ function sleep(ms: number) {
 }
 
 function App() {
-  const [view, setView] = useState<View>("onboarding");
+  const [view, setView] = useState<View>(() =>
+    localStorage.getItem(ONBOARDING_COMPLETE_KEY) === "true" ? "home" : "onboarding",
+  );
   const [step, setStep] = useState<OnboardingStep>("welcome");
   const [diagnose, setDiagnose] = useState<DiagnoseResult | null>(null);
   const [setupChecksState, setSetupChecksState] = useState<SetupCheck[]>(() =>
@@ -138,6 +151,7 @@ function App() {
   const [permissionDetail, setPermissionDetail] = useState("等待检查权限状态");
   const [initStatus, setInitStatus] = useState<InitStatus>("idle");
   const [initDetail, setInitDetail] = useState("等待检查初始化状态");
+  const [initProgress, setInitProgress] = useState<InitProgressStep[]>(() => createInitProgress());
   const [busy, setBusy] = useState(false);
   const [permissionOpened, setPermissionOpened] = useState(false);
   const [chats, setChats] = useState<AgentChat[]>([]);
@@ -158,6 +172,9 @@ function App() {
         if (userChats.length > 0) {
           setChats(userChats);
           setActiveChatId(userChats[0].id);
+          if (localStorage.getItem(ONBOARDING_COMPLETE_KEY) === "true") {
+            setView("chat");
+          }
         }
       } catch {
         localStorage.removeItem("wechat-agent-chats");
@@ -170,6 +187,27 @@ function App() {
   }, [chats]);
 
   useEffect(() => {
+    if (localStorage.getItem(ONBOARDING_COMPLETE_KEY) === "true") return;
+
+    let cancelled = false;
+    async function detectCompletedOnboarding() {
+      try {
+        const result = await call<InitCheckResult>("check_local_init_status");
+        if (!cancelled && result.queryReady) {
+          completeOnboarding();
+        }
+      } catch {
+        // Keep the normal onboarding flow if the local wx-cli check is not ready yet.
+      }
+    }
+
+    void detectCompletedOnboarding();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
     if (view !== "onboarding" || step !== "permission") return;
     void refreshPermissionStatus();
   }, [view, step]);
@@ -177,18 +215,15 @@ function App() {
   useEffect(() => {
     if (view !== "onboarding" || step !== "confirm") return;
     let cancelled = false;
-    setInitStatus("checking");
-    setInitDetail("正在确认本机微信读取能力是否已经可用");
-
-    void (async () => {
-      await sleep(520);
+    const timer = window.setTimeout(() => {
       if (!cancelled) {
-        await refreshInitStatus();
+        void refreshInitStatus();
       }
-    })();
+    }, 90);
 
     return () => {
       cancelled = true;
+      window.clearTimeout(timer);
     };
   }, [view, step]);
 
@@ -203,16 +238,14 @@ function App() {
       let result = await call<DiagnoseResult>("diagnose_environment");
       await revealSetupChecks(result);
       setDiagnose(result);
-      const missingTools = result.checks.some(
-        (item) => ["wx", "opencli"].includes(item.key) && !item.ok,
-      );
+      const missingTools = result.checks.some((item) => item.key === "wx" && !item.ok);
 
       if (missingTools) {
         setSetupPhase("installing");
         setSetupLog("缺少本机读取工具，正在尝试自动安装");
         setSetupChecksState((prev) =>
           prev.map((check) =>
-            ["wx", "opencli"].includes(check.key)
+            check.key === "wx"
               ? { ...check, status: "checking", detail: "正在自动安装" }
               : check,
           ),
@@ -222,7 +255,7 @@ function App() {
         setSetupLog("正在重新验证本地依赖");
         setSetupChecksState((prev) =>
           prev.map((check) =>
-            ["wx", "opencli"].includes(check.key)
+            check.key === "wx"
               ? { ...check, status: "checking", detail: "正在安装后复查" }
               : check,
           ),
@@ -232,8 +265,9 @@ function App() {
         setDiagnose(result);
       }
 
-      setSetupLog(result.ok ? "环境检查完成" : "仍有项目需要授权或确认");
-      setSetupPhase(result.ok ? "ready" : "needsAttention");
+      const setupReady = setupEnvironmentReady(result);
+      setSetupLog(setupReady ? "环境检查完成，下一步授权磁盘访问" : "仍有项目需要处理");
+      setSetupPhase(setupReady ? "ready" : "needsAttention");
     } catch (error) {
       setSetupLog(errorMessage(error));
       setSetupPhase("error");
@@ -248,7 +282,8 @@ function App() {
   async function handlePermissionAction() {
     if (permissionStatus === "granted") {
       setInitStatus("checking");
-      setInitDetail("正在确认本机微信读取能力是否已经可用");
+      setInitDetail("正在读取本机配置，并尝试验证 1 条微信会话。");
+      setInitProgress(createInitProgress({ config: "checking" }));
       setStep("confirm");
       return;
     }
@@ -296,17 +331,39 @@ function App() {
 
   async function refreshInitStatus() {
     setInitStatus("checking");
-    setInitDetail("正在确认本机微信读取能力是否已经可用");
+    setInitDetail("正在检查本机配置");
+    setInitProgress(createInitProgress({ config: "checking" }));
     try {
-      await withMinimumDelay(call<SessionSummary[]>("list_sessions"));
-      setInitStatus("ready");
-      setInitDetail("已检测到可用的本机微信读取能力");
-      return true;
+      const result = await call<InitCheckResult>("check_local_init_status");
+      return applyInitCheckResult(result);
     } catch (error) {
       setInitStatus("needsInit");
       setInitDetail(errorMessage(error) || "尚未完成初始化，需要执行一次本机初始化");
+      setInitProgress(createInitProgress({ query: "blocked" }));
       return false;
     }
+  }
+
+  function applyInitCheckResult(result: InitCheckResult) {
+    if (!result.configReady) {
+      setInitStatus("needsInit");
+      setInitDetail(result.detail || "尚未创建 ~/.wx-cli 本机配置，需要执行一次初始化");
+      setInitProgress(createInitProgress({ query: "blocked" }));
+      return false;
+    }
+
+    if (result.queryReady) {
+      setInitStatus("ready");
+      setInitDetail(result.detail || "已检测到可用的本机微信读取能力");
+      setInitProgress(createInitProgress({ config: "ready", query: "ready", finish: "ready" }));
+      localStorage.setItem(ONBOARDING_COMPLETE_KEY, "true");
+      return true;
+    }
+
+    setInitStatus("needsInit");
+    setInitDetail(result.detail || "本机配置已存在，但还不能读取微信会话，需要重新初始化");
+    setInitProgress(createInitProgress({ query: "blocked" }));
+    return false;
   }
 
   async function revealSetupChecks(result: DiagnoseResult) {
@@ -342,7 +399,7 @@ function App() {
 
   async function confirmInit() {
     if (initStatus === "ready") {
-      setStep("ready");
+      completeOnboarding();
       return;
     }
 
@@ -350,18 +407,32 @@ function App() {
       return;
     }
 
+    if (initStatus === "waitingExternal") {
+      setBusy(true);
+      try {
+        const ready = await refreshInitStatus();
+        if (ready) {
+          completeOnboarding();
+        }
+      } finally {
+        setBusy(false);
+      }
+      return;
+    }
+
     setBusy(true);
     setInitStatus("initializing");
-    setInitDetail("正在执行本机初始化，可能需要输入 macOS 密码");
+    setInitDetail("正在打开 Terminal，按 wx-cli 推荐流程执行初始化。");
+    setInitProgress(createInitProgress({ query: "checking" }));
     try {
       await call("run_wx_init");
-      const ready = await refreshInitStatus();
-      if (ready) {
-        setStep("ready");
-      }
+      setInitStatus("waitingExternal");
+      setInitDetail("已打开 Terminal。请在 Terminal 中完成 wx-cli 初始化，看到验证通过后回到这里重新检查。");
+      setInitProgress(createInitProgress({ query: "blocked" }));
     } catch (error) {
       setInitStatus("error");
       setInitDetail(errorMessage(error));
+      setInitProgress(createInitProgress({ query: "blocked" }));
     } finally {
       setBusy(false);
     }
@@ -384,7 +455,8 @@ function App() {
         {
           id: pendingId,
           role: "assistant",
-          content: "正在读取本机微信记录并整理回答…",
+          content: "",
+          thinkingStep: "定位微信会话",
           pending: true,
         },
       ],
@@ -397,7 +469,7 @@ function App() {
 
   async function answerQuestion(chatId: string, messageId: string, question: string) {
     try {
-      const sessions = await call<SessionSummary[]>("list_sessions").catch(() => fallbackSessions);
+      const sessions = await call<SessionSummary[]>("list_sessions");
       const resolution = resolveQuestionSession(question, sessions);
 
       if (!resolution.session) {
@@ -405,15 +477,21 @@ function App() {
         return;
       }
 
+      setAssistantThinking(chatId, messageId, `读取「${resolution.session.title}」聊天记录`);
       const exported = await call<ExportResult>("export_history", {
-        session: resolution.session.title,
+        session: resolution.session.id,
         since: "2026-04-13",
         limit: 5000,
       });
-      replaceAssistant(chatId, messageId, "", []);
+      setAssistantThinking(chatId, messageId, "组织本地上下文");
       const streamId = `${chatId}:${messageId}:${Date.now()}`;
+      let streamed = false;
       const unlistenDelta = await listen<ChatDeltaPayload>("chat:delta", (event) => {
         if (event.payload.streamId === streamId) {
+          if (!streamed) {
+            replaceAssistant(chatId, messageId, "", []);
+          }
+          streamed = true;
           appendAssistantDelta(chatId, messageId, event.payload.delta);
         }
       });
@@ -424,10 +502,15 @@ function App() {
       });
 
       try {
+        setAssistantThinking(chatId, messageId, "请求模型生成回答");
         const response = await call<{ answer: string; citations: Citation[] }>("ask_qwen_stream", {
           request: { question, contextFile: exported.file },
           streamId,
         });
+        if (!streamed && response.answer.trim()) {
+          replaceAssistant(chatId, messageId, response.answer, response.citations);
+          return;
+        }
         finishAssistant(chatId, messageId, response.citations);
       } finally {
         unlistenDelta();
@@ -437,7 +520,7 @@ function App() {
       replaceAssistant(
         chatId,
         messageId,
-        `已经收到问题，但本机 CLI 或 Qwen 调用还没有完成：${errorMessage(error)}\n\n你可以先检查 opencli / wx 是否可用，以及是否设置了 QWEN_API_KEY。`,
+        `已经收到问题，但本机 CLI 或 Qwen 调用还没有完成：${errorMessage(error)}\n\n你可以先检查 wx-cli 是否可用，以及是否设置了 QWEN_API_KEY。`,
         [],
       );
     }
@@ -476,6 +559,7 @@ function App() {
                       ...message,
                       content: `${message.content}${delta}`,
                       pending: false,
+                      thinkingStep: undefined,
                     }
                   : message,
               ),
@@ -499,6 +583,7 @@ function App() {
                       content,
                       citations,
                       pending: false,
+                      thinkingStep: undefined,
                     }
                   : message,
               ),
@@ -521,6 +606,7 @@ function App() {
                       ...message,
                       citations,
                       pending: false,
+                      thinkingStep: undefined,
                     }
                   : message,
               ),
@@ -549,7 +635,8 @@ function App() {
                 {
                   id: pendingId,
                   role: "assistant",
-                  content: "正在继续读取本机微信记录并整理回答…",
+                  content: "",
+                  thinkingStep: "结合上下文继续分析",
                   pending: true,
                 },
               ],
@@ -572,6 +659,29 @@ function App() {
     }
   }
 
+  function setAssistantThinking(chatId: string, messageId: string, thinkingStep: string) {
+    setChats((prev) =>
+      prev.map((chat) =>
+        chat.id === chatId
+          ? {
+              ...chat,
+              messages: chat.messages.map((message) =>
+                message.id === messageId
+                  ? {
+                      ...message,
+                      content: "",
+                      thinkingStep,
+                      pending: true,
+                    }
+                  : message,
+              ),
+              updatedAt: "刚刚",
+            }
+          : chat,
+      ),
+    );
+  }
+
   function handleOnboardingBack() {
     if (step === "setup") {
       setStep("welcome");
@@ -588,6 +698,11 @@ function App() {
     }
   }
 
+  function completeOnboarding() {
+    localStorage.setItem(ONBOARDING_COMPLETE_KEY, "true");
+    setView("home");
+  }
+
   if (view === "onboarding") {
     return (
       <Onboarding
@@ -600,6 +715,7 @@ function App() {
         permissionDetail={permissionDetail}
         initStatus={initStatus}
         initDetail={initDetail}
+        initProgress={initProgress}
         busy={busy}
         permissionOpened={permissionOpened}
         onStart={startSetup}
@@ -611,7 +727,7 @@ function App() {
         }}
         onPermission={handlePermissionAction}
         onConfirm={confirmInit}
-        onReady={() => setView("home")}
+        onReady={completeOnboarding}
       />
     );
   }
@@ -621,7 +737,10 @@ function App() {
       <ChatShell
         chats={chats}
         activeChatId={activeChat.id}
-        onNew={() => setView("home")}
+        onNew={() => {
+          setActiveChatId("");
+          setView("home");
+        }}
         onOpen={(id) => {
           setActiveChatId(id);
           setView("chat");
@@ -642,8 +761,11 @@ function App() {
   return (
     <ChatShell
       chats={chats}
-      activeChatId={activeChatId}
-      onNew={() => setView("home")}
+      activeChatId=""
+      onNew={() => {
+        setActiveChatId("");
+        setView("home");
+      }}
       onOpen={(id) => {
         setActiveChatId(id);
         setView("chat");
@@ -665,6 +787,7 @@ function Onboarding({
   permissionDetail,
   initStatus,
   initDetail,
+  initProgress,
   busy,
   permissionOpened,
   onStart,
@@ -683,6 +806,7 @@ function Onboarding({
   permissionDetail: string;
   initStatus: InitStatus;
   initDetail: string;
+  initProgress: InitProgressStep[];
   busy: boolean;
   permissionOpened: boolean;
   onStart: () => void;
@@ -742,6 +866,9 @@ function Onboarding({
             permissionDetail={permissionDetail}
             initStatus={initStatus}
             initDetail={initDetail}
+            initProgress={initProgress}
+            busy={busy}
+            onConfirm={onConfirm}
           />
         </div>
         <button
@@ -761,12 +888,12 @@ function Onboarding({
           disabled={
             busy ||
             (step === "permission" && permissionStatus === "checking") ||
-            (step === "confirm" && (initStatus === "checking" || initStatus === "initializing"))
+            (step === "confirm" && initStatus !== "ready")
           }
         >
           {busy ||
           (step === "permission" && permissionStatus === "checking") ||
-          (step === "confirm" && (initStatus === "checking" || initStatus === "initializing")) ? (
+          (step === "confirm" && initStatus === "checking") ? (
             <LoaderCircle className="spin" size={16} />
           ) : null}
           {step === "welcome"
@@ -785,12 +912,12 @@ function Onboarding({
                       : "打开系统设置"
                 : step === "confirm"
                   ? initStatus === "checking"
-                    ? "正在检查初始化"
+                    ? "正在检查"
                     : initStatus === "ready"
                       ? "下一步"
                       : initStatus === "initializing"
                         ? "正在初始化"
-                        : "初始化并继续"
+                        : "等待初始化"
                   : "进入新对话"}
           {step === "permission" && !permissionOpened && permissionStatus !== "granted" ? (
             <ArrowUpRight size={16} />
@@ -896,7 +1023,7 @@ function MockPanel({
     return (
       <div className="mock-panel mock-cli dark">
         <div className="mock-line muted">local init</div>
-        <div>{initChecking ? "$ opencli wx sessions -n 1" : initReady ? "$ 本机读取能力已可用" : "$ wx init"}</div>
+        <div>{initChecking ? "$ wx sessions -n 1" : initReady ? "$ 本机读取能力已可用" : "$ wx init"}</div>
         <div>{initReady ? "$ 跳过重复初始化" : "$ 检查本机读取状态"}</div>
         <div className={initReady ? "success-line" : "mock-line muted"}>
           {initChecking ? "checking local query ability" : initReady ? "ready for local query" : "waiting for initialization"}
@@ -950,6 +1077,9 @@ function StepContent({
   permissionDetail,
   initStatus,
   initDetail,
+  initProgress,
+  busy,
+  onConfirm,
 }: {
   step: OnboardingStep;
   diagnose: DiagnoseResult | null;
@@ -961,6 +1091,9 @@ function StepContent({
   permissionDetail: string;
   initStatus: InitStatus;
   initDetail: string;
+  initProgress: InitProgressStep[];
+  busy: boolean;
+  onConfirm: () => void;
 }) {
   if (step === "welcome") {
     return (
@@ -1005,17 +1138,27 @@ function StepContent({
     const content = initStateCopy(initStatus, initDetail);
     return (
       <div className={`warning-card init-state ${initStatus}`}>
-        {initStatus === "checking" || initStatus === "initializing" ? (
-          <LoaderCircle className="spin" size={20} />
-        ) : initStatus === "ready" ? (
-          <CircleCheck size={20} />
-        ) : (
-          <Terminal size={20} />
-        )}
-        <div>
-          <strong>{content.title}</strong>
-          <span>{content.text}</span>
+        <div className="init-state-header">
+          <strong>
+            {content.title}
+            {(initStatus === "idle" || initStatus === "checking") && <AnimatedEllipsis />}
+          </strong>
+          <InitStatusPill status={initStatus} />
         </div>
+        <span>{content.text}</span>
+        {content.log ? (
+          <details className="init-log-details">
+            <summary>查看最近日志</summary>
+            <pre>{content.log}</pre>
+          </details>
+        ) : null}
+        {initStatus !== "checking" && initStatus !== "ready" && <InitProgressList steps={initProgress} />}
+        {(initStatus === "needsInit" || initStatus === "waitingExternal" || initStatus === "error") && (
+          <button className="inline-init-button" type="button" onClick={onConfirm} disabled={busy}>
+            {busy ? <LoaderCircle className="spin" size={15} /> : <Terminal size={15} />}
+            {initStatus === "waitingExternal" ? "重新检查" : "开始初始化"}
+          </button>
+        )}
       </div>
     );
   }
@@ -1053,6 +1196,57 @@ function StatusCard({ status, title, text }: { status: SetupCheckStatus; title: 
           <em>{statusLabel}</em>
         </strong>
         <span>{text}</span>
+      </div>
+    </div>
+  );
+}
+
+function AnimatedEllipsis() {
+  return (
+    <span className="animated-ellipsis" aria-hidden="true">
+      <i />
+      <i />
+      <i />
+    </span>
+  );
+}
+
+function InitStatusPill({ status }: { status: InitStatus }) {
+  const label =
+    status === "checking"
+      ? "检查中"
+      : status === "ready"
+        ? "已完成"
+      : status === "initializing"
+        ? "执行中"
+        : status === "waitingExternal"
+          ? "等待完成"
+        : "需要处理";
+
+  return <em className={`init-status-pill ${status}`}>{label}</em>;
+}
+
+function InitProgressList({ steps }: { steps: InitProgressStep[] }) {
+  const activeStep = activeInitProgressStep(steps);
+  if (!activeStep) return null;
+
+  const labels: Record<InitProgressStatus, string> = {
+    pending: "等待",
+    checking: "检查中",
+    ready: "完成",
+    blocked: "需要处理",
+  };
+
+  return (
+    <div className="init-progress-list">
+      <div className={`init-progress-row ${activeStep.status}`} key={activeStep.key}>
+        <div>
+          <strong>
+            {activeStep.label}
+            <em>{labels[activeStep.status]}</em>
+          </strong>
+          <span>{activeStep.detail}</span>
+        </div>
       </div>
     </div>
   );
@@ -1193,21 +1387,50 @@ function ExistingChat({
       <div className="message-column">
         {chat.messages.map((message) => (
           <article className={`message ${message.role} ${message.pending ? "pending" : ""}`} key={message.id}>
-            <p>{message.content}</p>
-            {message.citations && message.citations.length > 0 && (
-              <div className="citation-box">
-                {message.citations.map((citation) => (
-                  <span key={citation.source}>
-                    {citation.label}: <code>{citation.source}</code>
-                  </span>
-                ))}
-              </div>
+            {message.pending && message.thinkingStep ? (
+              <ThinkingCard step={message.thinkingStep} />
+            ) : message.role === "assistant" ? (
+              <MarkdownContent content={message.content} />
+            ) : (
+              <p>{message.content}</p>
             )}
           </article>
         ))}
       </div>
       <div className="conversation-composer">
         <ChatComposer placeholder="要求后续变更" input={input} setInput={setInput} onSubmit={onSubmit} compact />
+      </div>
+    </div>
+  );
+}
+
+function MarkdownContent({ content }: { content: string }) {
+  return (
+    <div className="markdown-content">
+      <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
+    </div>
+  );
+}
+
+function ThinkingCard({ step }: { step: string }) {
+  const stages = ["理解问题", "检索本地记录", "组织证据", "生成回答"];
+
+  return (
+    <div className="thinking-card" aria-live="polite">
+      <div className="thinking-card-header">
+        <span className="thinking-pulse">
+          <i />
+          <i />
+          <i />
+        </span>
+        <strong>{step}</strong>
+      </div>
+      <div className="thinking-stage-row">
+        {stages.map((stage, index) => (
+          <span key={stage} style={{ animationDelay: `${index * 180}ms` }}>
+            {stage}
+          </span>
+        ))}
       </div>
     </div>
   );
@@ -1264,27 +1487,58 @@ function errorMessage(error: unknown) {
   return JSON.stringify(error);
 }
 
+function setupEnvironmentReady(diagnose: DiagnoseResult) {
+  const checkByKey = new Map(diagnose.checks.map((check) => [check.key, check]));
+  return SETUP_DEPENDENCY_KEYS.every((key) => checkByKey.get(key)?.ok);
+}
+
+function createInitProgress(statuses: Partial<Record<InitProgressStep["key"], InitProgressStatus>> = {}): InitProgressStep[] {
+  return [
+    {
+      key: "config",
+      label: "检查是否需要初始化",
+      detail: "确认本机配置和读取状态",
+      status: statuses.config ?? "pending",
+    },
+    {
+      key: "query",
+      label: "执行本机初始化",
+      detail: "会打开 Terminal 执行 wx-cli 推荐流程",
+      status: statuses.query ?? "pending",
+    },
+    {
+      key: "finish",
+      label: "验证读取能力",
+      detail: "读取 1 条微信会话",
+      status: statuses.finish ?? "pending",
+    },
+  ];
+}
+
+function activeInitProgressStep(steps: InitProgressStep[]) {
+  return (
+    steps.find((step) => step.status === "checking") ??
+    steps.find((step) => step.status === "blocked") ??
+    null
+  );
+}
+
 function setupChecks(diagnose: DiagnoseResult | null, phase: SetupPhase, setupLog: string): SetupCheck[] {
-  const dependencyKeys = ["node", "npm", "wechat", "wx", "opencli", "wxCliDir"];
   const labels: Record<string, string> = {
     node: "准备运行环境",
     npm: "准备安装能力",
     wechat: "找到 Mac 微信",
     wx: "准备微信读取能力",
-    opencli: "准备本机执行能力",
-    wxCliDir: "确认本机配置",
   };
   const details: Record<string, string> = {
     node: "用于在本机运行微信助手",
     npm: "用于自动准备缺少的组件",
     wechat: "确认这台 Mac 已安装微信",
     wx: "让 App 能读取本机微信记录",
-    opencli: "让 App 能安全调用本机工具",
-    wxCliDir: "保存本机读取所需配置",
   };
 
   if (!diagnose) {
-    return dependencyKeys.map((key, index) => ({
+    return SETUP_DEPENDENCY_KEYS.map((key, index) => ({
       key,
       label: labels[key],
       detail: index === 0 ? setupLog : details[key],
@@ -1293,16 +1547,16 @@ function setupChecks(diagnose: DiagnoseResult | null, phase: SetupPhase, setupLo
   }
 
   const checkByKey = new Map(diagnose.checks.map((check) => [check.key, check]));
-  const firstBlockedIndex = dependencyKeys.findIndex((key) => checkByKey.get(key)?.ok === false);
+  const firstBlockedIndex = SETUP_DEPENDENCY_KEYS.findIndex((key) => checkByKey.get(key)?.ok === false);
   const activeIndex = phase === "checking" || phase === "verifying" ? firstBlockedIndex : -1;
 
-  return dependencyKeys.map((key, index) => {
+  return SETUP_DEPENDENCY_KEYS.map((key, index) => {
     const check = checkByKey.get(key);
     let status: SetupCheckStatus = check?.ok ? "ready" : "blocked";
 
     if (!check) {
       status = "pending";
-    } else if (phase === "installing" && ["wx", "opencli"].includes(key) && !check.ok) {
+    } else if (phase === "installing" && key === "wx" && !check.ok) {
       status = "checking";
     } else if (activeIndex === index && !check.ok) {
       status = "checking";
@@ -1321,7 +1575,6 @@ function setupCheckDetail(key: string, check: CheckItem | undefined, fallback: s
   if (!check) return fallback;
   if (check.ok) {
     if (key === "wechat") return "已找到 Mac 微信";
-    if (key === "wxCliDir") return "本机配置已准备好";
     return "已准备好";
   }
   return fallback;
@@ -1383,37 +1636,62 @@ function permissionStateCopy(status: PermissionStatus, permissionOpened: boolean
 }
 
 function initStateCopy(status: InitStatus, detail: string) {
+  const { text: cleanedDetail, log } = splitInitDetail(detail);
+
   if (status === "checking") {
     return {
-      title: "正在检查初始化状态",
-      text: "正在确认本机微信读取能力是否已经可用。",
+      title: "正在判断是否需要初始化",
+      text: "正在读取本机配置，并尝试验证 1 条微信会话。",
     };
   }
 
   if (status === "ready") {
     return {
-      title: "已完成初始化",
+      title: "初始化已完成",
       text: "本机微信读取能力已经可用，可以直接进入下一步。",
     };
   }
 
   if (status === "initializing") {
     return {
-      title: "正在初始化",
-      text: "桌面端正在执行本机初始化，可能需要输入 macOS 密码。",
+      title: "正在执行初始化",
+      text: "正在打开 Terminal，准备执行 wx-cli 推荐初始化流程。",
+    };
+  }
+
+  if (status === "waitingExternal") {
+    return {
+      title: "等待 Terminal 初始化完成",
+      text: cleanedDetail || "请在 Terminal 中完成初始化，然后回到这里重新检查。",
+      log,
     };
   }
 
   if (status === "error") {
     return {
       title: "初始化失败",
-      text: detail,
+      text: cleanedDetail,
+      log,
     };
   }
 
   return {
     title: "需要初始化",
-    text: "尚未检测到可用的本机微信读取能力，需要执行一次初始化。",
+    text: cleanedDetail || "尚未检测到可用的本机微信读取能力，需要执行一次初始化。",
+    log,
+  };
+}
+
+function splitInitDetail(detail: string) {
+  const marker = "[[INIT_LOG]]";
+  const index = detail.indexOf(marker);
+  if (index === -1) {
+    return { text: detail, log: "" };
+  }
+
+  return {
+    text: detail.slice(0, index).trim(),
+    log: detail.slice(index + marker.length).trim(),
   };
 }
 
@@ -1457,7 +1735,7 @@ function normalizeForSessionMatch(value: string) {
 
 function sessionClarificationMessage(options: SessionSummary[]) {
   if (options.length === 0) {
-    return "我还不能确定要检索哪个微信会话，而且当前没有从本机工具里读到可用会话名。请先确认 opencli wx sessions 能列出联系人或群聊，然后在问题里写出明确的群名或联系人名。";
+    return "我还不能确定要检索哪个微信会话，而且当前没有从本机工具里读到可用会话名。请先确认 wx sessions 能列出联系人或群聊，然后在问题里写出明确的群名或联系人名。";
   }
 
   const optionLines = options.map((session) => `- ${session.title}`).join("\n");
@@ -1479,7 +1757,7 @@ const onboardingCopy: Record<
     kicker: "欢迎",
     stepLabel: "Step 1 / 5",
     title: "先连接你的本机微信",
-    description: "微信助手会自动检查环境、安装 wx-cli / opencli，并在需要你确认时停下来。",
+    description: "微信助手会自动检查环境、安装 wx-cli，并在需要你确认时停下来。",
     leftTitle: "把微信历史变成可以提问的上下文",
     leftDescription: "桌面端负责本地工具、授权和初始化，数据默认留在你的 Mac 上。",
   },

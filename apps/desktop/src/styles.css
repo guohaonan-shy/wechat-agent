@@ -1422,7 +1422,15 @@ button {
   background: #111827;
 }
 
+.composer.generating button {
+  background: #111827;
+}
+
 .composer.has-input button:hover {
+  transform: translateY(-1px);
+}
+
+.composer.generating button:hover {
   transform: translateY(-1px);
 }
 

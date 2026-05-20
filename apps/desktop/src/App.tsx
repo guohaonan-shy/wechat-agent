@@ -18,6 +18,7 @@ import {
   Settings,
   ShieldCheck,
   Sparkles,
+  Square,
   SquarePen,
   Terminal,
   Trash2,
@@ -96,6 +97,11 @@ type ChatDeltaPayload = {
 };
 
 type ChatErrorPayload = {
+  streamId: string;
+  message: string;
+};
+
+type ChatCancelledPayload = {
   streamId: string;
   message: string;
 };
@@ -183,6 +189,7 @@ function App() {
   const [chats, setChats] = useState<AgentChat[]>([]);
   const [activeChatId, setActiveChatId] = useState("");
   const [input, setInput] = useState("");
+  const [activeStream, setActiveStream] = useState<{ streamId: string; chatId: string; messageId: string } | null>(null);
 
   const activeChat = useMemo(
     () => chats.find((chat) => chat.id === activeChatId) ?? chats[0],
@@ -504,11 +511,13 @@ function App() {
 
   async function answerQuestion(chatId: string, messageId: string, question: string) {
     const streamId = `${chatId}:${messageId}:${Date.now()}`;
+    setActiveStream({ streamId, chatId, messageId });
     let streamed = false;
     let unlistenDelta: (() => void) | undefined;
     let unlistenError: (() => void) | undefined;
     let unlistenStatus: (() => void) | undefined;
     let unlistenTool: (() => void) | undefined;
+    let unlistenCancelled: (() => void) | undefined;
 
     try {
       unlistenDelta = await listen<ChatDeltaPayload>("chat:delta", (event) => {
@@ -530,6 +539,11 @@ function App() {
             status: "error",
           });
           replaceAssistant(chatId, messageId, event.payload.message, []);
+        }
+      });
+      unlistenCancelled = await listen<ChatCancelledPayload>("chat:cancelled", (event) => {
+        if (event.payload.streamId === streamId) {
+          stopAssistant(chatId, messageId, event.payload.message);
         }
       });
       unlistenStatus = await listen<AgentStatusPayload>("agent:status", (event) => {
@@ -562,14 +576,28 @@ function App() {
       replaceAssistant(
         chatId,
         messageId,
-        `已经收到问题，但 agent runtime、wx-cli 或模型调用还没有完成：${errorMessage(error)}\n\n你可以先检查 wx-cli 是否可用、Node.js 是否为 22+，以及是否设置了 QWEN_API_KEY。`,
+        `已经收到问题，但 agent runtime、wx-cli 或模型调用还没有完成：${errorMessage(error)}\n\n你可以先检查 wx-cli 是否可用、Node.js 是否为 22+，以及是否设置了 AGENT_API_KEY。`,
         [],
       );
     } finally {
       unlistenDelta?.();
       unlistenError?.();
+      unlistenCancelled?.();
       unlistenStatus?.();
       unlistenTool?.();
+      setActiveStream((current) => (current?.streamId === streamId ? null : current));
+    }
+  }
+
+  async function stopActiveStream() {
+    if (!activeStream) return;
+    const current = activeStream;
+    stopAssistant(current.chatId, current.messageId, "已停止生成");
+    setActiveStream(null);
+    try {
+      await call("cancel_agent_runtime", { streamId: current.streamId });
+    } catch {
+      // The runtime may have already finished between the click and the command.
     }
   }
 
@@ -654,6 +682,38 @@ function App() {
                       citations,
                       pending: false,
                       thinkingStep: undefined,
+                    }
+                  : message,
+              ),
+              updatedAt: "刚刚",
+            }
+          : chat,
+      ),
+    );
+  }
+
+  function stopAssistant(chatId: string, messageId: string, fallbackContent: string) {
+    setChats((prev) =>
+      prev.map((chat) =>
+        chat.id === chatId
+          ? {
+              ...chat,
+              messages: chat.messages.map((message) =>
+                message.id === messageId
+                  ? {
+                      ...message,
+                      content: message.content.trim() ? message.content : fallbackContent,
+                      pending: false,
+                      thinkingStep: undefined,
+                      activities: [
+                        ...(message.activities ?? []),
+                        {
+                          id: `${messageId}_stopped_${Date.now()}`,
+                          kind: "status",
+                          label: "已停止生成",
+                          status: "done",
+                        },
+                      ],
                     }
                   : message,
               ),
@@ -876,6 +936,8 @@ function App() {
           input={input}
           setInput={setInput}
           onSubmit={continueChat}
+          generating={activeStream?.chatId === activeChat.id}
+          onStop={stopActiveStream}
           onClear={() => clearChat(activeChat.id)}
         />
       </ChatShell>
@@ -1467,12 +1529,16 @@ function ExistingChat({
   input,
   setInput,
   onSubmit,
+  generating,
+  onStop,
   onClear,
 }: {
   chat: AgentChat;
   input: string;
   setInput: (value: string) => void;
   onSubmit: (event: FormEvent) => void;
+  generating: boolean;
+  onStop: () => void;
   onClear: () => void;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
@@ -1533,7 +1599,15 @@ function ExistingChat({
         <div className="message-scroll-anchor" ref={bottomRef} />
       </div>
       <div className="conversation-composer">
-        <ChatComposer placeholder="要求后续变更" input={input} setInput={setInput} onSubmit={onSubmit} compact />
+        <ChatComposer
+          placeholder="要求后续变更"
+          input={input}
+          setInput={setInput}
+          onSubmit={onSubmit}
+          compact
+          generating={generating}
+          onStop={onStop}
+        />
       </div>
     </div>
   );
@@ -1600,12 +1674,16 @@ function ChatComposer({
   input,
   setInput,
   onSubmit,
+  generating = false,
+  onStop,
   compact = false,
 }: {
   placeholder: string;
   input: string;
   setInput: (value: string) => void;
   onSubmit: (event: FormEvent) => void;
+  generating?: boolean;
+  onStop?: () => void;
   compact?: boolean;
 }) {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -1618,7 +1696,17 @@ function ChatComposer({
   }, [input]);
 
   return (
-    <form className={`composer ${compact ? "compact" : ""} ${input.trim() ? "has-input" : ""}`} onSubmit={onSubmit}>
+    <form
+      className={`composer ${compact ? "compact" : ""} ${input.trim() ? "has-input" : ""} ${generating ? "generating" : ""}`}
+      onSubmit={(event) => {
+        if (generating) {
+          event.preventDefault();
+          onStop?.();
+          return;
+        }
+        onSubmit(event);
+      }}
+    >
       <textarea
         ref={textareaRef}
         value={input}
@@ -1632,8 +1720,8 @@ function ChatComposer({
         rows={2}
       />
       <div className="composer-actions" aria-hidden="false">
-        <button type="submit" aria-label="发送">
-          <ArrowUp size={20} />
+        <button type="submit" aria-label={generating ? "停止生成" : "发送"}>
+          {generating ? <Square size={16} fill="currentColor" /> : <ArrowUp size={20} />}
         </button>
       </div>
     </form>

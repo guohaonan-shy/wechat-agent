@@ -1,8 +1,10 @@
 use chrono::Utc;
 use futures_util::StreamExt;
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
+    collections::HashMap,
     env, fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -11,7 +13,11 @@ use tauri::{AppHandle, Emitter};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::Command as TokioCommand,
+    sync::Mutex,
 };
+
+static ACTIVE_AGENT_RUNTIMES: Lazy<Mutex<HashMap<String, u32>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -102,6 +108,13 @@ struct StreamDeltaPayload {
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct StreamErrorPayload {
+    stream_id: String,
+    message: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct StreamCancelledPayload {
     stream_id: String,
     message: String,
 }
@@ -1093,153 +1106,193 @@ async fn ask_agent_runtime(
         .stdout
         .take()
         .ok_or_else(|| "agent runtime stdout 不可用。".to_string())?;
+    if let Some(pid) = child.id() {
+        ACTIVE_AGENT_RUNTIMES
+            .lock()
+            .await
+            .insert(stream_id.clone(), pid);
+    }
+
     let mut reader = BufReader::new(stdout).lines();
     let mut answer = String::new();
     let mut citations: Vec<Citation> = Vec::new();
 
-    while let Some(line) = reader.next_line().await.map_err(|err| err.to_string())? {
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
-        let event_type = event
-            .get("type")
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
-
-        match event_type {
-            "status" => {
-                let message = event
-                    .get("message")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("Agent 正在处理")
-                    .to_string();
-                let _ = app.emit(
-                    "agent:status",
-                    AgentStatusPayload {
-                        stream_id: stream_id.clone(),
-                        message,
-                    },
-                );
+    let result = async {
+        while let Some(line) = reader.next_line().await.map_err(|err| err.to_string())? {
+            if line.trim().is_empty() {
+                continue;
             }
-            "tool_start" | "tool_done" => {
-                let tool = event
-                    .get("tool")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("tool")
-                    .to_string();
-                let label = event
-                    .get("label")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or(&tool)
-                    .to_string();
-                let summary = event
-                    .get("summary")
-                    .and_then(|value| value.as_str())
-                    .map(ToString::to_string);
-                let input = event.get("input").cloned();
-                let citation = event
-                    .get("citation")
-                    .and_then(|value| serde_json::from_value::<Citation>(value.clone()).ok());
-                if let Some(citation) = citation.clone() {
-                    citations.push(citation);
-                }
-                let _ = app.emit(
-                    "agent:tool",
-                    AgentToolPayload {
-                        stream_id: stream_id.clone(),
-                        tool,
-                        label,
-                        status: if event_type == "tool_start" {
-                            "running".to_string()
-                        } else {
-                            "done".to_string()
-                        },
-                        summary,
-                        input,
-                        citation,
-                    },
-                );
-            }
-            "delta" => {
-                if let Some(delta) = event.get("delta").and_then(|value| value.as_str()) {
-                    answer.push_str(delta);
+
+            let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            let event_type = event
+                .get("type")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+
+            match event_type {
+                "status" => {
+                    let message = event
+                        .get("message")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("Agent 正在处理")
+                        .to_string();
                     let _ = app.emit(
-                        "chat:delta",
-                        StreamDeltaPayload {
+                        "agent:status",
+                        AgentStatusPayload {
                             stream_id: stream_id.clone(),
-                            delta: delta.to_string(),
+                            message,
                         },
                     );
                 }
-            }
-            "done" => {
-                if answer.trim().is_empty() {
-                    answer = event
-                        .get("answer")
+                "tool_start" | "tool_done" => {
+                    let tool = event
+                        .get("tool")
                         .and_then(|value| value.as_str())
-                        .unwrap_or("")
+                        .unwrap_or("tool")
                         .to_string();
+                    let label = event
+                        .get("label")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or(&tool)
+                        .to_string();
+                    let summary = event
+                        .get("summary")
+                        .and_then(|value| value.as_str())
+                        .map(ToString::to_string);
+                    let input = event.get("input").cloned();
+                    let citation = event
+                        .get("citation")
+                        .and_then(|value| serde_json::from_value::<Citation>(value.clone()).ok());
+                    if let Some(citation) = citation.clone() {
+                        citations.push(citation);
+                    }
+                    let _ = app.emit(
+                        "agent:tool",
+                        AgentToolPayload {
+                            stream_id: stream_id.clone(),
+                            tool,
+                            label,
+                            status: if event_type == "tool_start" {
+                                "running".to_string()
+                            } else {
+                                "done".to_string()
+                            },
+                            summary,
+                            input,
+                            citation,
+                        },
+                    );
                 }
-                if let Some(event_citations) =
-                    event.get("citations").and_then(|value| value.as_array())
-                {
-                    citations = event_citations
-                        .iter()
-                        .filter_map(|value| serde_json::from_value::<Citation>(value.clone()).ok())
-                        .collect();
+                "delta" => {
+                    if let Some(delta) = event.get("delta").and_then(|value| value.as_str()) {
+                        answer.push_str(delta);
+                        let _ = app.emit(
+                            "chat:delta",
+                            StreamDeltaPayload {
+                                stream_id: stream_id.clone(),
+                                delta: delta.to_string(),
+                            },
+                        );
+                    }
                 }
+                "done" => {
+                    if answer.trim().is_empty() {
+                        answer = event
+                            .get("answer")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                    }
+                    if let Some(event_citations) =
+                        event.get("citations").and_then(|value| value.as_array())
+                    {
+                        citations = event_citations
+                            .iter()
+                            .filter_map(|value| {
+                                serde_json::from_value::<Citation>(value.clone()).ok()
+                            })
+                            .collect();
+                    }
+                }
+                "error" => {
+                    let message = event
+                        .get("message")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("Agent runtime 调用失败。")
+                        .to_string();
+                    let _ = app.emit(
+                        "chat:error",
+                        StreamErrorPayload {
+                            stream_id: stream_id.clone(),
+                            message: message.clone(),
+                        },
+                    );
+                    return Err(message);
+                }
+                _ => {}
             }
-            "error" => {
-                let message = event
-                    .get("message")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("Agent runtime 调用失败。")
-                    .to_string();
-                let _ = app.emit(
-                    "chat:error",
-                    StreamErrorPayload {
-                        stream_id: stream_id.clone(),
-                        message: message.clone(),
-                    },
-                );
-                return Err(message);
-            }
-            _ => {}
         }
-    }
 
-    let status = child.wait().await.map_err(|err| err.to_string())?;
-    if !status.success() {
-        let stderr = match stderr_task {
-            Some(task) => task.await.unwrap_or_default(),
-            None => String::new(),
-        };
-        let message = if stderr.trim().is_empty() {
-            format!("Agent runtime 退出失败：{status}")
-        } else {
-            stderr
-        };
+        let status = child.wait().await.map_err(|err| err.to_string())?;
+        if !status.success() {
+            let was_cancelled = !ACTIVE_AGENT_RUNTIMES.lock().await.contains_key(&stream_id);
+            if was_cancelled {
+                return Ok(AskResponse { answer, citations });
+            }
+            let stderr = match stderr_task {
+                Some(task) => task.await.unwrap_or_default(),
+                None => String::new(),
+            };
+            let message = if stderr.trim().is_empty() {
+                format!("Agent runtime 退出失败：{status}")
+            } else {
+                stderr
+            };
+            let _ = app.emit(
+                "chat:error",
+                StreamErrorPayload {
+                    stream_id: stream_id.clone(),
+                    message: message.clone(),
+                },
+            );
+            return Err(message);
+        }
+
         let _ = app.emit(
-            "chat:error",
-            StreamErrorPayload {
-                stream_id,
-                message: message.clone(),
+            "chat:done",
+            StreamPayload {
+                stream_id: stream_id.clone(),
             },
         );
-        return Err(message);
+        Ok(AskResponse { answer, citations })
     }
+    .await;
 
+    ACTIVE_AGENT_RUNTIMES.lock().await.remove(&stream_id);
+    result
+}
+
+#[tauri::command]
+async fn cancel_agent_runtime(app: AppHandle, stream_id: String) -> Result<(), String> {
+    let pid = ACTIVE_AGENT_RUNTIMES.lock().await.remove(&stream_id);
+    let Some(pid) = pid else {
+        return Ok(());
+    };
+
+    let _ = TokioCommand::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .await;
     let _ = app.emit(
-        "chat:done",
-        StreamPayload {
-            stream_id: stream_id.clone(),
+        "chat:cancelled",
+        StreamCancelledPayload {
+            stream_id,
+            message: "已停止生成".to_string(),
         },
     );
-    Ok(AskResponse { answer, citations })
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1282,7 +1335,8 @@ pub fn run() {
             export_history,
             ask_qwen,
             ask_qwen_stream,
-            ask_agent_runtime
+            ask_agent_runtime,
+            cancel_agent_runtime
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

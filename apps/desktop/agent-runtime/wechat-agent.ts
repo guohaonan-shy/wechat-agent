@@ -19,13 +19,20 @@ type Citation = {
 type RunContext = {
   citations: Citation[];
   exportDir: string;
+  fullScanRequested: boolean;
 };
 
 const exportDir = "/tmp/wechat-agent-kit/exports";
 const maxToolMessages = 900;
+const maxFullScanMessages = 10_000;
 const maxToolMessageChars = 80_000;
+const maxFullScanMessageChars = 240_000;
 const maxLlmContextChars = 32_000;
+const maxFullScanLlmContextChars = 240_000;
 const defaultHistoryPageSize = 500;
+const defaultHistoryLimit = 5_000;
+const fullScanFetchPageSize = 5_000;
+const maxFullScanExportMessages = 50_000;
 
 type NormalizedWechatMessage = {
   index: number;
@@ -34,6 +41,11 @@ type NormalizedWechatMessage = {
   sender: string;
   type: string;
   content: string;
+};
+
+type WechatSession = {
+  id: string;
+  title: string;
 };
 
 type HistoryPageFrom = "latest" | "oldest";
@@ -67,29 +79,39 @@ const exportWechatHistoryTool = tool({
     "返回 JSON contract: schemaVersion=wechat.history.v1, session, since, requestedLimit, messageCount, returnedMessageCount, timeRange, pagination, messages, truncated, llmContext。",
     "messages 是标准化后的微信消息数组，字段包含 index、time、timestamp、sender、type、content。",
     "默认从最新消息页开始返回，messages 在每页内部保持从旧到新的阅读顺序。",
+    "当用户问题要求全部、所有、完整、整体或全量分析时，本工具会自动启用 fullScan，一次返回尽量完整的导出范围；此时不需要你自行重复分页，除非 response.truncated=true。",
     "如果 pagination.hasNextPage=true，可用 pagination.nextOffset 再次调用本工具继续向更早的消息翻页。",
     "truncated=true 表示只返回了部分消息；此时不能声称已经完整阅读全部历史，应继续分页读取、说明范围限制，或要求缩小时间范围。",
   ].join("\n"),
   parameters: z.object({
     session: z.string().min(1).describe("微信会话名、群名、联系人名或 wx/opencli 可识别的 session id"),
     since: z.string().min(8).default(defaultSince()).describe("开始日期，YYYY-MM-DD"),
-    limit: z.number().int().min(1).max(10000).default(5000).describe("从 wx CLI 导出的最大消息数"),
+    limit: z.number().int().min(1).max(maxFullScanExportMessages).default(defaultHistoryLimit).describe("从 wx CLI 导出的最大消息数"),
     offset: z.number().int().min(0).default(0).describe("分页起点。第一页为 0，下一页使用 pagination.nextOffset"),
     pageSize: z.number().int().min(1).max(maxToolMessages).default(defaultHistoryPageSize).describe("本次返回给模型的最大消息条数"),
     pageFrom: z.enum(["latest", "oldest"]).default("latest").describe("分页方向。latest 表示从最新消息往更早消息翻页；oldest 表示从最早消息往更新消息翻页"),
   }),
   strict: true,
   execute: async ({ session, since, limit, offset, pageSize, pageFrom }, runContext) => {
-    const safeLimit = Math.min(Math.max(limit, 1), 10_000);
-    const safeOffset = Math.max(offset, 0);
-    const safePageSize = Math.min(Math.max(pageSize, 1), maxToolMessages);
+    const activeContext = runContext?.context as RunContext | undefined;
+    const fullScan = activeContext?.fullScanRequested === true;
+    const safeLimit = fullScan
+      ? Math.min(Math.max(limit, fullScanFetchPageSize), maxFullScanExportMessages)
+      : Math.min(Math.max(limit, 1), maxFullScanExportMessages);
+    const safeOffset = fullScan ? 0 : Math.max(offset, 0);
+    const safePageSize = fullScan
+      ? maxFullScanMessages
+      : Math.min(Math.max(pageSize, 1), maxToolMessages);
+    const safePageFrom = fullScan ? "oldest" : pageFrom;
     emit({
       type: "tool_start",
       tool: "export_wechat_history",
-      label: "导出聊天记录",
-      input: { session, since, limit: safeLimit, offset: safeOffset, pageSize: safePageSize, pageFrom },
+      label: fullScan ? "全量导出聊天记录" : "导出聊天记录",
+      input: { session, since, limit: safeLimit, offset: safeOffset, pageSize: safePageSize, pageFrom: safePageFrom, fullScan },
     });
-    const result = await runWx(["history", session, "--since", since, "-n", String(safeLimit), "--json"]);
+    const result = fullScan
+      ? await exportFullWechatHistory(session, since, safeLimit)
+      : await runWx(["history", session, "--since", since, "-n", String(safeLimit), "--json"]);
     await mkdir(exportDir, { recursive: true });
     const file = path.join(exportDir, `${safeFilePart(session)}-${timestamp()}.json`);
     await writeFile(file, result.stdout, "utf8");
@@ -100,15 +122,15 @@ const exportWechatHistoryTool = tool({
       safeLimit,
       safeOffset,
       safePageSize,
-      pageFrom,
+      safePageFrom,
+      fullScan,
     );
     const citation = { label: `本地导出：${session}`, source: file };
-    const activeContext = runContext?.context as RunContext | undefined;
     activeContext?.citations.push(citation);
     emit({
       type: "tool_done",
       tool: "export_wechat_history",
-      label: "导出聊天记录",
+      label: fullScan ? "全量导出聊天记录" : "导出聊天记录",
       summary: history.truncated
         ? `已导出 ${history.messageCount} 条，返回第 ${history.pagination.page} 页 ${history.returnedMessageCount} 条`
         : `已导出 ${history.messageCount} 条消息`,
@@ -149,12 +171,18 @@ const searchWechatMessagesTool = tool({
 });
 
 function configureModel() {
-  const apiKey = process.env.QWEN_API_KEY || process.env.DASHSCOPE_API_KEY || process.env.OPENAI_API_KEY;
+  const apiKey =
+    process.env.AGENT_API_KEY ||
+    process.env.DASHSCOPE_API_KEY ||
+    process.env.QWEN_API_KEY ||
+    process.env.OPENAI_API_KEY;
   if (!apiKey) {
-    throw new Error("缺少 QWEN_API_KEY、DASHSCOPE_API_KEY 或 OPENAI_API_KEY。");
+    throw new Error("缺少 AGENT_API_KEY、DASHSCOPE_API_KEY、QWEN_API_KEY 或 OPENAI_API_KEY。");
   }
 
   const baseURL =
+    process.env.AGENT_BASE_URL ||
+    process.env.DASHSCOPE_BASE_URL ||
     process.env.QWEN_BASE_URL ||
     process.env.OPENAI_BASE_URL ||
     (process.env.QWEN_API_KEY || process.env.DASHSCOPE_API_KEY
@@ -183,13 +211,19 @@ function createAgent() {
       "回答要简洁、具体、可核对。不要暴露 username、chatroom id、message id、local_id、JSON、文件路径或内部实现细节。",
       "export_wechat_history 的 tool response 是 wechat.history.v1：默认 pageFrom=latest，从最新消息页开始；messages 在每页内部保持从旧到新。",
       "messageCount 是导出的总消息数，returnedMessageCount 是本次返回给你的消息数；优先阅读 messages 与 llmContext。",
+      "如果用户要求全部、所有、完整、整体或全量分析，export_wechat_history 会自动启用 fullScan；只要 truncated=false，就可以把本次导出范围视为已完整读取，不需要再重复分页。",
       "如果 tool response 的 pagination.hasNextPage=true，并且用户要求分析全部/整体/所有消息，应使用 pagination.nextOffset 继续调用 export_wechat_history 读取更早一页，再综合回答。",
       "如果 tool response 的 truncated=true，你只能基于已读取页面回答，不能声称已经完整分析全部 messageCount 条消息。",
       "如果当前可见聊天记录不足以支持结论，明确说“当前可见聊天记录不足以判断”。",
       "默认检索最近 6 个月；如果用户给出更明确时间范围，按用户时间范围使用工具。",
       "不要代发微信消息，不要输出隐私敏感信息。对外分享建议脱敏。",
     ].join("\n"),
-    model: process.env.QWEN_MODEL || process.env.OPENAI_MODEL || "qwen3.6-plus",
+    model:
+      process.env.AGENT_MODEL ||
+      process.env.DEEPSEEK_MODEL ||
+      process.env.QWEN_MODEL ||
+      process.env.OPENAI_MODEL ||
+      "deepseek-v4-pro",
     tools: [listWechatSessionsTool, exportWechatHistoryTool, searchWechatMessagesTool],
     modelSettings: {
       temperature: 0.2,
@@ -210,6 +244,56 @@ async function runWx(args: string[]) {
         collectProcess(wx).then(resolve).catch(reject);
       });
   });
+}
+
+async function exportFullWechatHistory(session: string, since: string, maxMessages: number) {
+  let offset = 0;
+  let chat = session;
+  let chatType: unknown;
+  let isGroup: unknown;
+  const messages: unknown[] = [];
+  const pages: Array<{ offset: number; count: number; bytes: number }> = [];
+
+  while (messages.length < maxMessages) {
+    const pageLimit = Math.min(fullScanFetchPageSize, maxMessages - messages.length);
+    const result = await runWx([
+      "history",
+      session,
+      "--since",
+      since,
+      "--offset",
+      String(offset),
+      "-n",
+      String(pageLimit),
+      "--json",
+    ]);
+    const value = parseJsonObject(result.stdout);
+    const pageMessages = readMessageArray(value);
+    if (typeof value?.chat === "string") chat = value.chat;
+    if (value && typeof value === "object") {
+      const record = value as Record<string, unknown>;
+      chatType = record.chat_type ?? chatType;
+      isGroup = record.is_group ?? isGroup;
+    }
+
+    pages.push({ offset, count: pageMessages.length, bytes: result.stdout.length });
+    messages.push(...pageMessages);
+
+    if (pageMessages.length < pageLimit) break;
+    offset += pageMessages.length;
+  }
+
+  return {
+    stdout: JSON.stringify({
+      chat,
+      chat_type: chatType,
+      is_group: isGroup,
+      full_scan: true,
+      full_scan_pages: pages,
+      messages,
+    }),
+    stderr: "",
+  };
 }
 
 function collectProcess(child: ReturnType<typeof spawn>) {
@@ -234,7 +318,7 @@ function collectProcess(child: ReturnType<typeof spawn>) {
   });
 }
 
-function parseSessions(output: string) {
+function parseSessions(output: string): WechatSession[] {
   try {
     const value = JSON.parse(output);
     const array = Array.isArray(value) ? value : Array.isArray(value.sessions) ? value.sessions : [];
@@ -357,7 +441,7 @@ async function buildSessionHint(question: string) {
   }
 }
 
-function rankSessions(question: string, sessions: Array<{ id: string; title: string }>) {
+function rankSessions(question: string, sessions: WechatSession[]) {
   const normalizedQuestion = normalizeSessionText(question);
   return sessions
     .map((session) => {
@@ -443,17 +527,20 @@ function buildWechatHistoryResponse(
   offset: number,
   pageSize: number,
   pageFrom: HistoryPageFrom,
+  fullScan: boolean,
 ) {
   let value: any;
   try {
     value = JSON.parse(raw);
   } catch {
-    const llmContext = raw.slice(0, maxLlmContextChars);
+    const contextCharLimit = fullScan ? maxFullScanLlmContextChars : maxLlmContextChars;
+    const llmContext = raw.slice(0, contextCharLimit);
     return {
       schemaVersion: "wechat.history.v1",
       session,
       since,
       requestedLimit,
+      fullScan,
       bytes: raw.length,
       messageCount: 0,
       returnedMessageCount: 0,
@@ -470,16 +557,28 @@ function buildWechatHistoryResponse(
         returnedRange: null,
       },
       messages: [],
-      truncated: raw.length > maxLlmContextChars,
-      truncation: raw.length > maxLlmContextChars ? { reason: "raw_text_too_large", omittedMessageCount: null } : null,
+      truncated: raw.length > contextCharLimit,
+      truncation: raw.length > contextCharLimit ? { reason: "raw_text_too_large", omittedMessageCount: null } : null,
       llmContext,
       notes: "wx history did not return valid JSON; llmContext contains raw text.",
     };
   }
 
   const chat = typeof value.chat === "string" ? value.chat : session;
-  const allMessages = readMessageArray(value).map(normalizeWechatMessage).filter((message) => message.content);
-  const page = selectMessagesForTool(allMessages, offset, pageSize, pageFrom);
+  const allMessages = readMessageArray(value)
+    .map(normalizeWechatMessage)
+    .filter((message) => message.content)
+    .sort(compareMessagesByTime);
+  const selectionOptions = fullScan
+    ? {
+        maxMessages: maxFullScanMessages,
+        maxChars: maxFullScanMessageChars,
+      }
+    : {
+        maxMessages: maxToolMessages,
+        maxChars: maxToolMessageChars,
+      };
+  const page = selectMessagesForTool(allMessages, offset, pageSize, pageFrom, selectionOptions);
   const returnedMessages = page.messages;
   const truncated = page.hasNextPage || offset > 0 || allMessages.length > returnedMessages.length;
 
@@ -488,6 +587,7 @@ function buildWechatHistoryResponse(
     session: chat,
     since,
     requestedLimit,
+    fullScan,
     bytes: raw.length,
     messageCount: allMessages.length,
     returnedMessageCount: returnedMessages.length,
@@ -514,17 +614,19 @@ function buildWechatHistoryResponse(
     truncation: truncated
       ? {
           reason: "message_count_exceeds_page_budget",
-          maxReturnedMessages: maxToolMessages,
-          maxReturnedContentChars: maxToolMessageChars,
+          maxReturnedMessages: selectionOptions.maxMessages,
+          maxReturnedContentChars: selectionOptions.maxChars,
           omittedMessageCount: Math.max(allMessages.length - (offset + returnedMessages.length), 0),
         }
       : null,
-    llmContext: buildLlmContext(chat, returnedMessages, truncated, allMessages.length, pageFrom, offset),
+    llmContext: buildLlmContext(chat, returnedMessages, truncated, allMessages.length, pageFrom, offset, fullScan),
     notes: truncated
       ? pageFrom === "latest"
         ? "Only the current page is included. Use pagination.nextOffset with pageFrom=latest to fetch the next older page before making whole-history claims."
         : "Only the current page is included. Use pagination.nextOffset with pageFrom=oldest to fetch the next newer page before making whole-history claims."
-      : "All parsed messages are included in this tool response.",
+      : fullScan
+        ? "Full-scan mode is active. All parsed messages inside the exported limit are included in this tool response."
+        : "All parsed messages are included in this tool response.",
   };
 }
 
@@ -540,21 +642,31 @@ function normalizeWechatMessage(item: unknown, index: number): NormalizedWechatM
   };
 }
 
+function compareMessagesByTime(left: NormalizedWechatMessage, right: NormalizedWechatMessage) {
+  if (left.timestamp !== undefined && right.timestamp !== undefined) {
+    return left.timestamp - right.timestamp;
+  }
+  if (left.timestamp !== undefined) return -1;
+  if (right.timestamp !== undefined) return 1;
+  return left.index - right.index;
+}
+
 function selectMessagesForTool(
   messages: NormalizedWechatMessage[],
   offset: number,
   pageSize: number,
   pageFrom: HistoryPageFrom,
+  options: { maxMessages: number; maxChars: number } = { maxMessages: maxToolMessages, maxChars: maxToolMessageChars },
 ) {
   const selected: NormalizedWechatMessage[] = [];
   let contentChars = 0;
-  const pageLimit = Math.min(pageSize, maxToolMessages);
+  const pageLimit = Math.min(pageSize, options.maxMessages);
   const source = pageFrom === "latest" ? messages.slice(0, Math.max(messages.length - offset, 0)).reverse() : messages.slice(offset);
 
   for (const message of source) {
     if (selected.length >= pageLimit) break;
     const nextChars = message.time.length + message.sender.length + message.type.length + message.content.length;
-    if (selected.length > 0 && contentChars + nextChars > maxToolMessageChars) break;
+    if (selected.length > 0 && contentChars + nextChars > options.maxChars) break;
     if (pageFrom === "latest") {
       selected.unshift(message);
     } else {
@@ -588,17 +700,18 @@ function buildLlmContext(
   totalMessageCount: number,
   pageFrom: HistoryPageFrom,
   offset: number,
+  fullScan: boolean,
 ) {
   const lines = [
     `会话：${chat}`,
-    `消息数量：本次返回 ${messages.length} 条；导出总数 ${totalMessageCount} 条；分页方向：${pageFrom === "latest" ? "从最新向更早翻页" : "从最早向更新翻页"}；offset=${offset}；是否截断：${truncated ? "是" : "否"}`,
+    `消息数量：本次返回 ${messages.length} 条；导出总数 ${totalMessageCount} 条；模式：${fullScan ? "全量扫描" : "分页读取"}；分页方向：${pageFrom === "latest" ? "从最新向更早翻页" : "从最早向更新翻页"}；offset=${offset}；是否截断：${truncated ? "是" : "否"}`,
   ];
 
   for (const message of messages) {
     lines.push(`[${message.time}] ${message.sender}（${message.type}）：${message.content}`);
   }
 
-  return lines.join("\n").slice(0, maxLlmContextChars);
+  return lines.join("\n").slice(0, fullScan ? maxFullScanLlmContextChars : maxLlmContextChars);
 }
 
 function readMessageArray(value: unknown): unknown[] {
@@ -612,6 +725,15 @@ function readMessageArray(value: unknown): unknown[] {
   }
 
   return [];
+}
+
+function parseJsonObject(raw: string): Record<string, unknown> | undefined {
+  try {
+    const value = JSON.parse(raw);
+    return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function readText(value: unknown, key: string) {
@@ -704,7 +826,11 @@ function unquoteEnvValue(value: string) {
 
 async function main() {
   const input = await readInput();
-  const context: RunContext = { citations: [], exportDir };
+  const context: RunContext = {
+    citations: [],
+    exportDir,
+    fullScanRequested: wantsFullHistory(input.question),
+  };
 
   emit({ type: "status", message: "理解问题，准备本地微信工具" });
   await loadDotEnv();
@@ -712,7 +838,10 @@ async function main() {
 
   const agent = createAgent();
   const sessionHint = await buildSessionHint(input.question);
-  const agentInput = sessionHint ? `${sessionHint}\n\n用户问题：${input.question}` : input.question;
+  const fullScanHint = context.fullScanRequested
+    ? "已检测到用户要求完整/全量读取：调用 export_wechat_history 时会自动进入 fullScan。若工具返回 truncated=false，不要再重复分页。"
+    : "";
+  const agentInput = [sessionHint, fullScanHint, `用户问题：${input.question}`].filter(Boolean).join("\n\n");
   const runner = new Runner({ tracingDisabled: true });
   const stream = await runner.run(agent, agentInput, {
     context,
@@ -729,6 +858,12 @@ async function main() {
 
   await stream.completed;
   emit({ type: "done", answer: answer || String(stream.finalOutput ?? ""), citations: context.citations });
+}
+
+function wantsFullHistory(question: string) {
+  return /全部(?:的)?(?:消息|聊天|聊天记录|记录|内容)|所有(?:的)?(?:消息|聊天|聊天记录|记录|内容)|完整(?:的)?(?:聊天|聊天记录|记录|消息|内容|分析)|全量|整体分析|全面(?:的)?分析|重新、?全面|整个群|全群/.test(
+    question,
+  );
 }
 
 try {

@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import {
   ArrowLeft,
   ArrowRight,
@@ -12,20 +13,29 @@ import {
   LoaderCircle,
   MessageCircle,
   MessagesSquare,
+  MoreHorizontal,
   SearchCheck,
-  Send,
   Settings,
   ShieldCheck,
   Sparkles,
+  SquarePen,
   Terminal,
+  Trash2,
   TriangleAlert,
   UserSearch,
   Users,
 } from "lucide-react";
-import { FormEvent, ReactNode, useEffect, useMemo, useState } from "react";
+import { FormEvent, KeyboardEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 type OnboardingStep = "welcome" | "setup" | "permission" | "confirm" | "ready";
 type View = "onboarding" | "home" | "chat";
+type SetupPhase = "idle" | "checking" | "installing" | "verifying" | "ready" | "needsAttention" | "error";
+type SetupCheckStatus = "pending" | "checking" | "ready" | "blocked";
+type PermissionStatus = "idle" | "checking" | "granted" | "blocked" | "error";
+type InitStatus = "idle" | "checking" | "ready" | "needsInit" | "initializing" | "waitingExternal" | "error";
+type InitProgressStatus = "pending" | "checking" | "ready" | "blocked";
 
 type CheckItem = {
   key: string;
@@ -37,6 +47,26 @@ type CheckItem = {
 type DiagnoseResult = {
   ok: boolean;
   checks: CheckItem[];
+};
+
+type InitCheckResult = {
+  configReady: boolean;
+  queryReady: boolean;
+  detail: string;
+};
+
+type SetupCheck = {
+  key: string;
+  label: string;
+  detail: string;
+  status: SetupCheckStatus;
+};
+
+type InitProgressStep = {
+  key: "config" | "query" | "finish";
+  label: string;
+  detail: string;
+  status: InitProgressStatus;
 };
 
 type SessionSummary = {
@@ -59,11 +89,23 @@ type Citation = {
   source: string;
 };
 
+type ChatDeltaPayload = {
+  streamId: string;
+  delta: string;
+};
+
+type ChatErrorPayload = {
+  streamId: string;
+  message: string;
+};
+
 type ChatMessage = {
   id: string;
   role: "user" | "assistant";
   content: string;
   citations?: Citation[];
+  pending?: boolean;
+  thinkingStep?: string;
 };
 
 type AgentChat = {
@@ -73,66 +115,47 @@ type AgentChat = {
   messages: ChatMessage[];
 };
 
-const seedChats: AgentChat[] = [
-  {
-    id: "seed_product",
-    title: "产品讨论群摘要",
-    updatedAt: "1 天",
-    messages: [
-      {
-        id: "m1",
-        role: "assistant",
-        content:
-          "这条链路通了：桌面端负责低延迟交互和工具决策，本地执行器负责真正跑 opencli wx，两边靠结构化参数和输出衔接。\n\n如果要做原型，优先从 Tauri + 本地 CLI wrapper 开始，先把权限、初始化、检索和引用跑顺。",
-        citations: [
-          {
-            label: "本地导出批次",
-            source: "/tmp/wechat-agent-kit/exports/product-demo.json",
-          },
-        ],
-      },
-      {
-        id: "m2",
-        role: "user",
-        content: "明白了～",
-      },
-    ],
-  },
-  {
-    id: "seed_cli",
-    title: "本地工具调用链解释",
-    updatedAt: "昨天",
-    messages: [],
-  },
-  {
-    id: "seed_visit",
-    title: "来上海时间确认",
-    updatedAt: "3 天",
-    messages: [],
-  },
-];
-
-const fallbackSessions: SessionSummary[] = [
-  {
-    id: "demo-product",
-    title: "产品讨论群",
-    subtitle: "Demo fallback",
-  },
-];
+const MIN_STATUS_DELAY_MS = 650;
+const SETUP_CHECKING_DELAY_MS = 620;
+const SETUP_RESULT_DELAY_MS = 180;
+const SETUP_DEPENDENCY_KEYS = ["node", "npm", "wechat", "wx"];
+const ONBOARDING_COMPLETE_KEY = "wechat-agent-onboarding-complete";
 
 async function call<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   return invoke<T>(command, args);
 }
 
+async function withMinimumDelay<T>(promise: Promise<T>, delay = MIN_STATUS_DELAY_MS) {
+  const [result] = await Promise.all([promise, sleep(delay)]);
+  return result;
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
+}
+
 function App() {
-  const [view, setView] = useState<View>("onboarding");
+  const [view, setView] = useState<View>(() =>
+    localStorage.getItem(ONBOARDING_COMPLETE_KEY) === "true" ? "home" : "onboarding",
+  );
   const [step, setStep] = useState<OnboardingStep>("welcome");
   const [diagnose, setDiagnose] = useState<DiagnoseResult | null>(null);
+  const [setupChecksState, setSetupChecksState] = useState<SetupCheck[]>(() =>
+    setupChecks(null, "idle", "准备检查本地环境"),
+  );
+  const [setupPhase, setSetupPhase] = useState<SetupPhase>("idle");
   const [setupLog, setSetupLog] = useState("准备检查本地环境");
+  const [permissionStatus, setPermissionStatus] = useState<PermissionStatus>("idle");
+  const [permissionDetail, setPermissionDetail] = useState("等待检查权限状态");
+  const [initStatus, setInitStatus] = useState<InitStatus>("idle");
+  const [initDetail, setInitDetail] = useState("等待检查初始化状态");
+  const [initProgress, setInitProgress] = useState<InitProgressStep[]>(() => createInitProgress());
   const [busy, setBusy] = useState(false);
   const [permissionOpened, setPermissionOpened] = useState(false);
-  const [chats, setChats] = useState<AgentChat[]>(seedChats);
-  const [activeChatId, setActiveChatId] = useState("seed_product");
+  const [chats, setChats] = useState<AgentChat[]>([]);
+  const [activeChatId, setActiveChatId] = useState("");
   const [input, setInput] = useState("");
 
   const activeChat = useMemo(
@@ -145,9 +168,13 @@ function App() {
     if (stored) {
       try {
         const parsed = JSON.parse(stored) as AgentChat[];
-        if (parsed.length > 0) {
-          setChats(parsed);
-          setActiveChatId(parsed[0].id);
+        const userChats = parsed.filter((chat) => !chat.id.startsWith("seed_"));
+        if (userChats.length > 0) {
+          setChats(userChats);
+          setActiveChatId(userChats[0].id);
+          if (localStorage.getItem(ONBOARDING_COMPLETE_KEY) === "true") {
+            setView("chat");
+          }
         }
       } catch {
         localStorage.removeItem("wechat-agent-chats");
@@ -159,35 +186,112 @@ function App() {
     localStorage.setItem("wechat-agent-chats", JSON.stringify(chats));
   }, [chats]);
 
+  useEffect(() => {
+    if (localStorage.getItem(ONBOARDING_COMPLETE_KEY) === "true") return;
+
+    let cancelled = false;
+    async function detectCompletedOnboarding() {
+      try {
+        const result = await call<InitCheckResult>("check_local_init_status");
+        if (!cancelled && result.queryReady) {
+          completeOnboarding();
+        }
+      } catch {
+        // Keep the normal onboarding flow if the local wx-cli check is not ready yet.
+      }
+    }
+
+    void detectCompletedOnboarding();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (view !== "onboarding" || step !== "permission") return;
+    void refreshPermissionStatus();
+  }, [view, step]);
+
+  useEffect(() => {
+    if (view !== "onboarding" || step !== "confirm") return;
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      if (!cancelled) {
+        void refreshInitStatus();
+      }
+    }, 90);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [view, step]);
+
   async function startSetup() {
     setStep("setup");
     setBusy(true);
-    setSetupLog("正在检查 Mac 微信、Node.js、wx-cli 和 opencli");
+    setDiagnose(null);
+    setSetupChecksState(setupChecks(null, "checking", "正在准备本机微信连接"));
+    setSetupPhase("checking");
+    setSetupLog("正在准备本机微信连接");
     try {
       let result = await call<DiagnoseResult>("diagnose_environment");
+      await revealSetupChecks(result);
       setDiagnose(result);
-      const missingTools = result.checks.some(
-        (item) => ["wx", "opencli"].includes(item.key) && !item.ok,
-      );
+      const missingTools = result.checks.some((item) => item.key === "wx" && !item.ok);
 
       if (missingTools) {
-        setSetupLog("缺少 wx-cli / opencli，正在尝试自动安装");
+        setSetupPhase("installing");
+        setSetupLog("缺少本机读取工具，正在尝试自动安装");
+        setSetupChecksState((prev) =>
+          prev.map((check) =>
+            check.key === "wx"
+              ? { ...check, status: "checking", detail: "正在自动安装" }
+              : check,
+          ),
+        );
         await call("install_cli_tools");
+        setSetupPhase("verifying");
+        setSetupLog("正在重新验证本地依赖");
+        setSetupChecksState((prev) =>
+          prev.map((check) =>
+            check.key === "wx"
+              ? { ...check, status: "checking", detail: "正在安装后复查" }
+              : check,
+          ),
+        );
         result = await call<DiagnoseResult>("diagnose_environment");
+        await revealSetupChecks(result);
         setDiagnose(result);
       }
 
-      setSetupLog(result.ok ? "环境检查完成" : "仍有项目需要授权或确认");
-      setStep("permission");
+      const setupReady = setupEnvironmentReady(result);
+      setSetupLog(setupReady ? "环境检查完成，下一步授权磁盘访问" : "仍有项目需要处理");
+      setSetupPhase(setupReady ? "ready" : "needsAttention");
     } catch (error) {
       setSetupLog(errorMessage(error));
-      setStep("permission");
+      setSetupPhase("error");
+      setSetupChecksState((prev) =>
+        prev.map((check) => (check.status === "checking" ? { ...check, status: "blocked" } : check)),
+      );
     } finally {
       setBusy(false);
     }
   }
 
   async function handlePermissionAction() {
+    if (permissionStatus === "granted") {
+      setInitStatus("checking");
+      setInitDetail("正在读取本机配置，并尝试验证 1 条微信会话。");
+      setInitProgress(createInitProgress({ config: "checking" }));
+      setStep("confirm");
+      return;
+    }
+
+    if (permissionStatus === "checking") {
+      return;
+    }
+
     if (!permissionOpened) {
       setPermissionOpened(true);
       try {
@@ -198,34 +302,137 @@ function App() {
       return;
     }
 
-    setBusy(true);
-    setSetupLog("正在重新检查微信数据访问权限");
+    await refreshPermissionStatus();
+  }
+
+  async function refreshPermissionStatus() {
+    setPermissionStatus("checking");
+    setPermissionDetail("正在确认桌面端是否能读取微信数据目录");
     try {
-      const result = await call<DiagnoseResult>("diagnose_environment");
+      const result = await withMinimumDelay(call<DiagnoseResult>("diagnose_environment"));
       setDiagnose(result);
       const dataAccess = result.checks.find((item) => item.key === "wechatDataAccess");
 
       if (dataAccess?.ok) {
-        setSetupLog("微信数据访问权限已确认");
-        setStep("confirm");
+        setPermissionStatus("granted");
+        setPermissionDetail(dataAccess.detail);
+        return true;
       } else {
-        setSetupLog(dataAccess?.detail ?? "尚未检测到微信数据访问权限");
+        setPermissionStatus("blocked");
+        setPermissionDetail(dataAccess?.detail ?? "尚未检测到微信数据访问权限");
+        return false;
       }
     } catch (error) {
-      setSetupLog(errorMessage(error));
-    } finally {
-      setBusy(false);
+      setPermissionStatus("error");
+      setPermissionDetail(errorMessage(error));
+      return false;
+    }
+  }
+
+  async function refreshInitStatus() {
+    setInitStatus("checking");
+    setInitDetail("正在检查本机配置");
+    setInitProgress(createInitProgress({ config: "checking" }));
+    try {
+      const result = await call<InitCheckResult>("check_local_init_status");
+      return applyInitCheckResult(result);
+    } catch (error) {
+      setInitStatus("needsInit");
+      setInitDetail(errorMessage(error) || "尚未完成初始化，需要执行一次本机初始化");
+      setInitProgress(createInitProgress({ query: "blocked" }));
+      return false;
+    }
+  }
+
+  function applyInitCheckResult(result: InitCheckResult) {
+    if (!result.configReady) {
+      setInitStatus("needsInit");
+      setInitDetail(result.detail || "尚未创建 ~/.wx-cli 本机配置，需要执行一次初始化");
+      setInitProgress(createInitProgress({ query: "blocked" }));
+      return false;
+    }
+
+    if (result.queryReady) {
+      setInitStatus("ready");
+      setInitDetail(result.detail || "已检测到可用的本机微信读取能力");
+      setInitProgress(createInitProgress({ config: "ready", query: "ready", finish: "ready" }));
+      localStorage.setItem(ONBOARDING_COMPLETE_KEY, "true");
+      return true;
+    }
+
+    setInitStatus("needsInit");
+    setInitDetail(result.detail || "本机配置已存在，但还不能读取微信会话，需要重新初始化");
+    setInitProgress(createInitProgress({ query: "blocked" }));
+    return false;
+  }
+
+  async function revealSetupChecks(result: DiagnoseResult) {
+    const nextChecks = setupChecks(result, "ready", setupLog);
+
+    for (const nextCheck of nextChecks) {
+      setSetupChecksState((prev) =>
+        prev.map((check) =>
+          check.key === nextCheck.key
+            ? {
+                ...check,
+                detail: nextCheck.detail,
+                status: "checking",
+              }
+            : check,
+        ),
+      );
+      await sleep(SETUP_CHECKING_DELAY_MS);
+      setSetupChecksState((prev) =>
+        prev.map((check) =>
+          check.key === nextCheck.key
+            ? {
+                ...check,
+                detail: nextCheck.detail,
+                status: nextCheck.status,
+              }
+            : check,
+        ),
+      );
+      await sleep(SETUP_RESULT_DELAY_MS);
     }
   }
 
   async function confirmInit() {
+    if (initStatus === "ready") {
+      completeOnboarding();
+      return;
+    }
+
+    if (initStatus === "checking" || initStatus === "initializing") {
+      return;
+    }
+
+    if (initStatus === "waitingExternal") {
+      setBusy(true);
+      try {
+        const ready = await refreshInitStatus();
+        if (ready) {
+          completeOnboarding();
+        }
+      } finally {
+        setBusy(false);
+      }
+      return;
+    }
+
     setBusy(true);
+    setInitStatus("initializing");
+    setInitDetail("正在打开 Terminal，按 wx-cli 推荐流程执行初始化。");
+    setInitProgress(createInitProgress({ query: "checking" }));
     try {
       await call("run_wx_init");
-      setStep("ready");
+      setInitStatus("waitingExternal");
+      setInitDetail("已打开 Terminal。请在 Terminal 中完成 wx-cli 初始化，看到验证通过后回到这里重新检查。");
+      setInitProgress(createInitProgress({ query: "blocked" }));
     } catch (error) {
-      setSetupLog(errorMessage(error));
-      setStep("ready");
+      setInitStatus("error");
+      setInitDetail(errorMessage(error));
+      setInitProgress(createInitProgress({ query: "blocked" }));
     } finally {
       setBusy(false);
     }
@@ -238,39 +445,82 @@ function App() {
 
     setInput("");
     const chatId = `chat_${Date.now()}`;
+    const pendingId = `${chatId}_assistant_pending`;
     const newChat: AgentChat = {
       id: chatId,
       title: question.length > 18 ? `${question.slice(0, 18)}…` : question,
       updatedAt: "刚刚",
-      messages: [{ id: `${chatId}_user`, role: "user", content: question }],
+      messages: [
+        { id: `${chatId}_user`, role: "user", content: question },
+        {
+          id: pendingId,
+          role: "assistant",
+          content: "",
+          thinkingStep: "定位微信会话",
+          pending: true,
+        },
+      ],
     };
     setChats((prev) => [newChat, ...prev]);
     setActiveChatId(chatId);
     setView("chat");
+    await answerQuestion(chatId, pendingId, question);
+  }
 
+  async function answerQuestion(chatId: string, messageId: string, question: string) {
     try {
-      const sessions = await call<SessionSummary[]>("list_sessions").catch(() => fallbackSessions);
+      const sessions = await call<SessionSummary[]>("list_sessions");
       const resolution = resolveQuestionSession(question, sessions);
 
       if (!resolution.session) {
-        appendAssistant(chatId, sessionClarificationMessage(resolution.options), []);
+        replaceAssistant(chatId, messageId, sessionClarificationMessage(resolution.options), []);
         return;
       }
 
+      setAssistantThinking(chatId, messageId, `读取「${resolution.session.title}」聊天记录`);
       const exported = await call<ExportResult>("export_history", {
-        session: resolution.session.title,
+        session: resolution.session.id,
         since: "2026-04-13",
         limit: 5000,
       });
-      const response = await call<{ answer: string; citations: Citation[] }>("ask_qwen", {
-        request: { question, contextFile: exported.file },
+      setAssistantThinking(chatId, messageId, "组织本地上下文");
+      const streamId = `${chatId}:${messageId}:${Date.now()}`;
+      let streamed = false;
+      const unlistenDelta = await listen<ChatDeltaPayload>("chat:delta", (event) => {
+        if (event.payload.streamId === streamId) {
+          if (!streamed) {
+            replaceAssistant(chatId, messageId, "", []);
+          }
+          streamed = true;
+          appendAssistantDelta(chatId, messageId, event.payload.delta);
+        }
+      });
+      const unlistenError = await listen<ChatErrorPayload>("chat:error", (event) => {
+        if (event.payload.streamId === streamId) {
+          replaceAssistant(chatId, messageId, event.payload.message, []);
+        }
       });
 
-      appendAssistant(chatId, response.answer, response.citations);
+      try {
+        setAssistantThinking(chatId, messageId, "请求模型生成回答");
+        const response = await call<{ answer: string; citations: Citation[] }>("ask_qwen_stream", {
+          request: { question, contextFile: exported.file },
+          streamId,
+        });
+        if (!streamed && response.answer.trim()) {
+          replaceAssistant(chatId, messageId, response.answer, response.citations);
+          return;
+        }
+        finishAssistant(chatId, messageId, response.citations);
+      } finally {
+        unlistenDelta();
+        unlistenError();
+      }
     } catch (error) {
-      appendAssistant(
+      replaceAssistant(
         chatId,
-        `已经收到问题，但本机 CLI 或 Qwen 调用还没有完成：${errorMessage(error)}\n\n你可以先检查 opencli / wx 是否可用，以及是否设置了 QWEN_API_KEY。`,
+        messageId,
+        `已经收到问题，但本机 CLI 或 Qwen 调用还没有完成：${errorMessage(error)}\n\n你可以先检查 wx-cli 是否可用，以及是否设置了 QWEN_API_KEY。`,
         [],
       );
     }
@@ -297,27 +547,22 @@ function App() {
     );
   }
 
-  function continueChat(event: FormEvent) {
-    event.preventDefault();
-    const question = input.trim();
-    if (!question || !activeChat) return;
-    setInput("");
+  function appendAssistantDelta(chatId: string, messageId: string, delta: string) {
     setChats((prev) =>
       prev.map((chat) =>
-        chat.id === activeChat.id
+        chat.id === chatId
           ? {
               ...chat,
-              messages: [
-                ...chat.messages,
-                { id: `m_${Date.now()}`, role: "user", content: question },
-                {
-                  id: `m_${Date.now()}_a`,
-                  role: "assistant",
-                  content:
-                    "这条追问会沿用当前对话上下文。下一步实现会把上一轮导出批次作为 contextFile 继续传给 Qwen。",
-                  citations: chat.messages.flatMap((message) => message.citations ?? []).slice(0, 1),
-                },
-              ],
+              messages: chat.messages.map((message) =>
+                message.id === messageId
+                  ? {
+                      ...message,
+                      content: `${message.content}${delta}`,
+                      pending: false,
+                      thinkingStep: undefined,
+                    }
+                  : message,
+              ),
               updatedAt: "刚刚",
             }
           : chat,
@@ -325,19 +570,164 @@ function App() {
     );
   }
 
+  function replaceAssistant(chatId: string, messageId: string, content: string, citations: Citation[]) {
+    setChats((prev) =>
+      prev.map((chat) =>
+        chat.id === chatId
+          ? {
+              ...chat,
+              messages: chat.messages.map((message) =>
+                message.id === messageId
+                  ? {
+                      ...message,
+                      content,
+                      citations,
+                      pending: false,
+                      thinkingStep: undefined,
+                    }
+                  : message,
+              ),
+              updatedAt: "刚刚",
+            }
+          : chat,
+      ),
+    );
+  }
+
+  function finishAssistant(chatId: string, messageId: string, citations: Citation[]) {
+    setChats((prev) =>
+      prev.map((chat) =>
+        chat.id === chatId
+          ? {
+              ...chat,
+              messages: chat.messages.map((message) =>
+                message.id === messageId
+                  ? {
+                      ...message,
+                      citations,
+                      pending: false,
+                      thinkingStep: undefined,
+                    }
+                  : message,
+              ),
+              updatedAt: "刚刚",
+            }
+          : chat,
+      ),
+    );
+  }
+
+  function continueChat(event: FormEvent) {
+    event.preventDefault();
+    const question = input.trim();
+    if (!question || !activeChat) return;
+    setInput("");
+    const userMessageId = `m_${Date.now()}`;
+    const pendingId = `${userMessageId}_assistant_pending`;
+    setChats((prev) =>
+      prev.map((chat) =>
+        chat.id === activeChat.id
+          ? {
+              ...chat,
+              messages: [
+                ...chat.messages,
+                { id: userMessageId, role: "user", content: question },
+                {
+                  id: pendingId,
+                  role: "assistant",
+                  content: "",
+                  thinkingStep: "结合上下文继续分析",
+                  pending: true,
+                },
+              ],
+              updatedAt: "刚刚",
+            }
+          : chat,
+      ),
+    );
+    void answerQuestion(activeChat.id, pendingId, `${activeChat.title} ${question}`);
+  }
+
+  function clearChat(chatId: string) {
+    const nextChats = chats.filter((chat) => chat.id !== chatId);
+    setChats(nextChats);
+
+    if (activeChatId === chatId) {
+      const nextActiveChat = nextChats[0];
+      setActiveChatId(nextActiveChat?.id ?? "");
+      setView(nextActiveChat ? "chat" : "home");
+    }
+  }
+
+  function setAssistantThinking(chatId: string, messageId: string, thinkingStep: string) {
+    setChats((prev) =>
+      prev.map((chat) =>
+        chat.id === chatId
+          ? {
+              ...chat,
+              messages: chat.messages.map((message) =>
+                message.id === messageId
+                  ? {
+                      ...message,
+                      content: "",
+                      thinkingStep,
+                      pending: true,
+                    }
+                  : message,
+              ),
+              updatedAt: "刚刚",
+            }
+          : chat,
+      ),
+    );
+  }
+
+  function handleOnboardingBack() {
+    if (step === "setup") {
+      setStep("welcome");
+      return;
+    }
+
+    if (step === "permission") {
+      setStep("setup");
+      return;
+    }
+
+    if (step === "confirm") {
+      setStep("permission");
+    }
+  }
+
+  function completeOnboarding() {
+    localStorage.setItem(ONBOARDING_COMPLETE_KEY, "true");
+    setView("home");
+  }
+
   if (view === "onboarding") {
     return (
       <Onboarding
         step={step}
         diagnose={diagnose}
+        setupChecks={setupChecksState}
+        setupPhase={setupPhase}
         setupLog={setupLog}
+        permissionStatus={permissionStatus}
+        permissionDetail={permissionDetail}
+        initStatus={initStatus}
+        initDetail={initDetail}
+        initProgress={initProgress}
         busy={busy}
         permissionOpened={permissionOpened}
         onStart={startSetup}
-        onBack={() => setStep(step === "confirm" ? "permission" : "setup")}
+        onBack={handleOnboardingBack}
+        onSetupNext={() => {
+          setPermissionStatus("checking");
+          setPermissionDetail("正在确认桌面端是否能读取微信数据目录");
+          setStep("permission");
+        }}
         onPermission={handlePermissionAction}
         onConfirm={confirmInit}
-        onReady={() => setView("home")}
+        onReady={completeOnboarding}
       />
     );
   }
@@ -347,13 +737,23 @@ function App() {
       <ChatShell
         chats={chats}
         activeChatId={activeChat.id}
-        onNew={() => setView("home")}
+        onNew={() => {
+          setActiveChatId("");
+          setView("home");
+        }}
         onOpen={(id) => {
           setActiveChatId(id);
           setView("chat");
         }}
+        onClear={clearChat}
       >
-        <ExistingChat chat={activeChat} input={input} setInput={setInput} onSubmit={continueChat} />
+        <ExistingChat
+          chat={activeChat}
+          input={input}
+          setInput={setInput}
+          onSubmit={continueChat}
+          onClear={() => clearChat(activeChat.id)}
+        />
       </ChatShell>
     );
   }
@@ -361,12 +761,16 @@ function App() {
   return (
     <ChatShell
       chats={chats}
-      activeChatId={activeChatId}
-      onNew={() => setView("home")}
+      activeChatId=""
+      onNew={() => {
+        setActiveChatId("");
+        setView("home");
+      }}
       onOpen={(id) => {
         setActiveChatId(id);
         setView("chat");
       }}
+      onClear={clearChat}
     >
       <ChatHome input={input} setInput={setInput} onSubmit={submitQuestion} />
     </ChatShell>
@@ -376,36 +780,63 @@ function App() {
 function Onboarding({
   step,
   diagnose,
+  setupChecks,
+  setupPhase,
   setupLog,
+  permissionStatus,
+  permissionDetail,
+  initStatus,
+  initDetail,
+  initProgress,
   busy,
   permissionOpened,
   onStart,
   onBack,
+  onSetupNext,
   onPermission,
   onConfirm,
   onReady,
 }: {
   step: OnboardingStep;
   diagnose: DiagnoseResult | null;
+  setupChecks: SetupCheck[];
+  setupPhase: SetupPhase;
   setupLog: string;
+  permissionStatus: PermissionStatus;
+  permissionDetail: string;
+  initStatus: InitStatus;
+  initDetail: string;
+  initProgress: InitProgressStep[];
   busy: boolean;
   permissionOpened: boolean;
   onStart: () => void;
   onBack: () => void;
+  onSetupNext: () => void;
   onPermission: () => void;
   onConfirm: () => void;
   onReady: () => void;
 }) {
   const config = onboardingCopy[step];
-  const showBack = step === "permission" || step === "confirm";
+  const showBack = step === "setup" || step === "permission" || step === "confirm";
 
   return (
     <main className="onboarding-frame">
       <section className="onboarding-left">
         <Brand />
         <TrustPill />
-        <MockPanel step={step} diagnose={diagnose} setupLog={setupLog} />
-        <div className={`left-copy ${step === "confirm" || step === "ready" ? "left-copy-centered" : ""}`}>
+        <MockPanel
+          key={`mock-${step}`}
+          step={step}
+          setupChecks={setupChecks}
+          setupPhase={setupPhase}
+          setupLog={setupLog}
+          permissionStatus={permissionStatus}
+          initStatus={initStatus}
+        />
+        <div
+          key={`copy-${step}`}
+          className={`left-copy ${step === "confirm" || step === "ready" ? "left-copy-centered" : ""}`}
+        >
           <h2>{config.leftTitle}</h2>
           <p>{config.leftDescription}</p>
         </div>
@@ -421,10 +852,24 @@ function Onboarding({
           <strong>{config.kicker}</strong>
           <span className={`step-pill ${step === "ready" ? "ready" : ""}`}>{config.stepLabel}</span>
         </div>
-        <div className="step-body">
+        <div key={`body-${step}`} className={`step-body ${step === "setup" ? "setup-body" : ""}`}>
           <h1>{config.title}</h1>
           <p>{config.description}</p>
-          <StepContent step={step} diagnose={diagnose} setupLog={setupLog} permissionOpened={permissionOpened} />
+          <StepContent
+            step={step}
+            diagnose={diagnose}
+            setupChecks={setupChecks}
+            setupPhase={setupPhase}
+            setupLog={setupLog}
+            permissionOpened={permissionOpened}
+            permissionStatus={permissionStatus}
+            permissionDetail={permissionDetail}
+            initStatus={initStatus}
+            initDetail={initDetail}
+            initProgress={initProgress}
+            busy={busy}
+            onConfirm={onConfirm}
+          />
         </div>
         <button
           className="primary-cta bottom-right"
@@ -433,28 +878,52 @@ function Onboarding({
             step === "welcome"
               ? onStart
               : step === "setup"
-                ? undefined
+                ? onSetupNext
                 : step === "permission"
                   ? onPermission
                   : step === "confirm"
                     ? onConfirm
                     : onReady
           }
-          disabled={step === "setup" || busy}
+          disabled={
+            busy ||
+            (step === "permission" && permissionStatus === "checking") ||
+            (step === "confirm" && initStatus !== "ready")
+          }
         >
-          {busy || step === "setup" ? <LoaderCircle className="spin" size={16} /> : null}
+          {busy ||
+          (step === "permission" && permissionStatus === "checking") ||
+          (step === "confirm" && initStatus === "checking") ? (
+            <LoaderCircle className="spin" size={16} />
+          ) : null}
           {step === "welcome"
             ? "开始自动设置"
             : step === "setup"
-              ? "正在自动设置"
+              ? busy
+                ? "正在自动设置"
+                : "下一步：授权磁盘访问"
               : step === "permission"
-                ? permissionOpened
-                  ? "我已授权，继续"
-                  : "打开系统设置"
+                ? permissionStatus === "checking"
+                  ? "正在检查权限"
+                  : permissionStatus === "granted"
+                    ? "下一步"
+                    : permissionOpened
+                      ? "我已授权，重新检查"
+                      : "打开系统设置"
                 : step === "confirm"
-                  ? "确认并初始化"
+                  ? initStatus === "checking"
+                    ? "正在检查"
+                    : initStatus === "ready"
+                      ? "下一步"
+                      : initStatus === "initializing"
+                        ? "正在初始化"
+                        : "等待初始化"
                   : "进入新对话"}
-          {step === "permission" && !permissionOpened ? <ArrowUpRight size={16} /> : <ArrowRight size={16} />}
+          {step === "permission" && !permissionOpened && permissionStatus !== "granted" ? (
+            <ArrowUpRight size={16} />
+          ) : (
+            <ArrowRight size={16} />
+          )}
         </button>
       </section>
     </main>
@@ -481,53 +950,84 @@ function TrustPill() {
 
 function MockPanel({
   step,
-  diagnose,
+  setupChecks,
+  setupPhase,
   setupLog,
+  permissionStatus,
+  initStatus,
 }: {
   step: OnboardingStep;
-  diagnose: DiagnoseResult | null;
+  setupChecks: SetupCheck[];
+  setupPhase: SetupPhase;
   setupLog: string;
+  permissionStatus: PermissionStatus;
+  initStatus: InitStatus;
 }) {
   if (step === "setup") {
+    const readyCount = setupChecks.filter((check) => check.status === "ready").length;
+    const blockedCount = setupChecks.filter((check) => check.status === "blocked").length;
+    const activeCheck = setupChecks.find((check) => check.status === "checking");
+    const checkedCount = readyCount + blockedCount;
+    const progressUnits = checkedCount + (activeCheck ? 0.55 : 0);
+    const progress = `${Math.max(8, Math.round((progressUnits / setupChecks.length) * 100))}%`;
+    const logLines = setupLogLines(setupChecks, setupPhase).slice(-3);
     return (
       <div className="mock-panel mock-cli compact">
         <div className="mock-line muted">&gt; 自动执行</div>
-        <div>checking WeChat.app</div>
-        <div>installing wx-cli</div>
-        <div>preparing opencli</div>
+        <div className="mock-log-window">
+          <div className="mock-log-track" key={logLines.join("|")}>
+            {logLines.map((line, index) => (
+              <div
+                className={`terminal-log-line ${line.tone ?? "default"} ${index === logLines.length - 1 ? "current" : ""}`}
+                key={line.text}
+                style={{ animationDelay: `${index * 45}ms` }}
+              >
+                <span className="terminal-prefix">{line.prefix}</span>
+                <span>{line.text}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+        <div className="mock-count-line">{`已检查 ${checkedCount}/${setupChecks.length}`}</div>
         <div className="progress-track">
-          <span style={{ width: diagnose ? "84%" : "54%" }} />
+          <span style={{ width: progress }} />
         </div>
       </div>
     );
   }
 
   if (step === "permission") {
+    const permissionReady = permissionStatus === "granted";
+    const permissionChecking = permissionStatus === "checking";
     return (
       <div className="mock-panel">
         <div className="mock-heading">
           <ShieldCheck size={18} />
           macOS 权限
         </div>
-        <div className="permission-card">
+        <div className={`permission-card ${permissionReady ? "granted" : ""}`}>
           <strong>完全磁盘访问</strong>
-          <span>需要用户在系统设置中手动开启</span>
+          <span>{permissionReady ? "桌面端已可读取微信数据目录" : "需要用户在系统设置中手动开启"}</span>
         </div>
-        <div className="soft-row">
-          <Settings size={17} />
-          打开系统设置
+        <div className={`soft-row ${permissionReady ? "granted" : permissionChecking ? "checking" : ""}`}>
+          {permissionChecking ? <LoaderCircle className="spin" size={17} /> : permissionReady ? <CircleCheck size={17} /> : <Settings size={17} />}
+          {permissionChecking ? "正在检查授权状态" : permissionReady ? "授权已确认" : "打开系统设置"}
         </div>
       </div>
     );
   }
 
   if (step === "confirm") {
+    const initReady = initStatus === "ready";
+    const initChecking = initStatus === "checking" || initStatus === "initializing";
     return (
       <div className="mock-panel mock-cli dark">
         <div className="mock-line muted">local init</div>
-        <div>$ wx init</div>
-        <div>$ opencli wx sessions -n 5</div>
-        <div className="success-line">ready for local query</div>
+        <div>{initChecking ? "$ wx sessions -n 1" : initReady ? "$ 本机读取能力已可用" : "$ wx init"}</div>
+        <div>{initReady ? "$ 跳过重复初始化" : "$ 检查本机读取状态"}</div>
+        <div className={initReady ? "success-line" : "mock-line muted"}>
+          {initChecking ? "checking local query ability" : initReady ? "ready for local query" : "waiting for initialization"}
+        </div>
       </div>
     );
   }
@@ -569,60 +1069,96 @@ function MockPanel({
 function StepContent({
   step,
   diagnose,
+  setupChecks,
+  setupPhase,
   setupLog,
   permissionOpened,
+  permissionStatus,
+  permissionDetail,
+  initStatus,
+  initDetail,
+  initProgress,
+  busy,
+  onConfirm,
 }: {
   step: OnboardingStep;
   diagnose: DiagnoseResult | null;
+  setupChecks: SetupCheck[];
+  setupPhase: SetupPhase;
   setupLog: string;
   permissionOpened: boolean;
+  permissionStatus: PermissionStatus;
+  permissionDetail: string;
+  initStatus: InitStatus;
+  initDetail: string;
+  initProgress: InitProgressStep[];
+  busy: boolean;
+  onConfirm: () => void;
 }) {
   if (step === "welcome") {
     return (
       <div className="card-stack">
         <InfoCard icon={<MessageCircle />} title="读取本机微信记录" text="只读取已同步到 Mac 的本地数据" tone="green" />
-        <InfoCard icon={<Terminal />} title="安装 wx-cli 与 opencli" text="桌面端一键处理检查和安装" tone="blue" />
+        <InfoCard icon={<Terminal />} title="准备本机读取工具" text="桌面端一键处理检查和安装" tone="blue" />
         <InfoCard icon={<Sparkles />} title="完成后直接开始提问" text="用聊天方式查询群聊、联系人和引用" tone="purple" />
       </div>
     );
   }
 
   if (step === "setup") {
-    const checks = diagnose?.checks.slice(2, 7) ?? [
-      { key: "wechat", label: "Mac 微信已发现", ok: true, detail: "/Applications/WeChat.app" },
-      { key: "tools", label: "正在安装 wx-cli 与 opencli", ok: false, detail: setupLog },
-      { key: "keychain", label: "稍后写入 macOS Keychain", ok: false, detail: "密钥不在界面中明文暴露" },
-    ];
     return (
-      <div className="card-stack">
-        {checks.map((check) => (
-          <StatusCard key={check.key} ok={check.ok} title={check.label} text={check.detail} />
+      <div className="card-stack setup-grid">
+        {setupChecks.map((check) => (
+          <StatusCard key={check.key} status={check.status} title={check.label} text={check.detail} />
         ))}
       </div>
     );
   }
 
   if (step === "permission") {
+    const content = permissionStateCopy(permissionStatus, permissionOpened, permissionDetail);
     return (
-      <div className="warning-card">
-        <TriangleAlert size={20} />
+      <div className={`warning-card permission-state ${permissionStatus}`}>
+        {permissionStatus === "checking" ? (
+          <LoaderCircle className="spin" size={20} />
+        ) : permissionStatus === "granted" ? (
+          <CircleCheck size={20} />
+        ) : (
+          <TriangleAlert size={20} />
+        )}
         <div>
-          <strong>{permissionOpened ? "等待重新检查权限" : "尚未授予完全磁盘访问"}</strong>
-          <span>{permissionOpened ? "完成授权后点击右下角继续" : "微信数据路径当前不可读取"}</span>
+          <strong>{content.title}</strong>
+          <span>{content.text}</span>
         </div>
       </div>
     );
   }
 
   if (step === "confirm") {
+    const content = initStateCopy(initStatus, initDetail);
     return (
-      <div className="code-card">
-        <span>将由桌面端执行</span>
-        <code>
-          wx init
-          <br />
-          opencli wx sessions -n 5
-        </code>
+      <div className={`warning-card init-state ${initStatus}`}>
+        <div className="init-state-header">
+          <strong>
+            {content.title}
+            {(initStatus === "idle" || initStatus === "checking") && <AnimatedEllipsis />}
+          </strong>
+          <InitStatusPill status={initStatus} />
+        </div>
+        <span>{content.text}</span>
+        {content.log ? (
+          <details className="init-log-details">
+            <summary>查看最近日志</summary>
+            <pre>{content.log}</pre>
+          </details>
+        ) : null}
+        {initStatus !== "checking" && initStatus !== "ready" && <InitProgressList steps={initProgress} />}
+        {(initStatus === "needsInit" || initStatus === "waitingExternal" || initStatus === "error") && (
+          <button className="inline-init-button" type="button" onClick={onConfirm} disabled={busy}>
+            {busy ? <LoaderCircle className="spin" size={15} /> : <Terminal size={15} />}
+            {initStatus === "waitingExternal" ? "重新检查" : "开始初始化"}
+          </button>
+        )}
       </div>
     );
   }
@@ -647,13 +1183,70 @@ function InfoCard({ icon, title, text, tone }: { icon: ReactNode; title: string;
   );
 }
 
-function StatusCard({ ok, title, text }: { ok: boolean; title: string; text: string }) {
+function StatusCard({ status, title, text }: { status: SetupCheckStatus; title: string; text: string }) {
+  const icon = status === "ready" ? <CircleCheck /> : status === "checking" ? <LoaderCircle className="spin" /> : <Download />;
+  const statusLabel =
+    status === "ready" ? "已就绪" : status === "checking" ? "检查中" : status === "blocked" ? "需要处理" : "等待检查";
   return (
-    <div className="info-card">
-      <div className={`status-icon ${ok ? "ok" : "pending"}`}>{ok ? <CircleCheck /> : <Download />}</div>
+    <div className={`info-card setup-check ${status}`}>
+      <div className={`status-icon ${status}`}>{icon}</div>
       <div>
-        <strong>{title}</strong>
+        <strong>
+          {title}
+          <em>{statusLabel}</em>
+        </strong>
         <span>{text}</span>
+      </div>
+    </div>
+  );
+}
+
+function AnimatedEllipsis() {
+  return (
+    <span className="animated-ellipsis" aria-hidden="true">
+      <i />
+      <i />
+      <i />
+    </span>
+  );
+}
+
+function InitStatusPill({ status }: { status: InitStatus }) {
+  const label =
+    status === "checking"
+      ? "检查中"
+      : status === "ready"
+        ? "已完成"
+      : status === "initializing"
+        ? "执行中"
+        : status === "waitingExternal"
+          ? "等待完成"
+        : "需要处理";
+
+  return <em className={`init-status-pill ${status}`}>{label}</em>;
+}
+
+function InitProgressList({ steps }: { steps: InitProgressStep[] }) {
+  const activeStep = activeInitProgressStep(steps);
+  if (!activeStep) return null;
+
+  const labels: Record<InitProgressStatus, string> = {
+    pending: "等待",
+    checking: "检查中",
+    ready: "完成",
+    blocked: "需要处理",
+  };
+
+  return (
+    <div className="init-progress-list">
+      <div className={`init-progress-row ${activeStep.status}`} key={activeStep.key}>
+        <div>
+          <strong>
+            {activeStep.label}
+            <em>{labels[activeStep.status]}</em>
+          </strong>
+          <span>{activeStep.detail}</span>
+        </div>
       </div>
     </div>
   );
@@ -673,12 +1266,14 @@ function ChatShell({
   activeChatId,
   onNew,
   onOpen,
+  onClear,
   children,
 }: {
   chats: AgentChat[];
   activeChatId: string;
   onNew: () => void;
   onOpen: (id: string) => void;
+  onClear: (id: string) => void;
   children: ReactNode;
 }) {
   return (
@@ -689,22 +1284,31 @@ function ChatShell({
           微信助手
         </div>
         <button className="new-chat" type="button" onClick={onNew}>
-          <Sparkles size={17} />
+          <SquarePen size={17} />
           新对话
         </button>
         <div className="history-title">对话</div>
         <div className="history-list">
-          {chats.map((chat) => (
-            <button
-              className={`history-item ${chat.id === activeChatId ? "active" : ""}`}
-              key={chat.id}
-              type="button"
-              onClick={() => onOpen(chat.id)}
-            >
-              <span>{chat.title}</span>
-              <small>{chat.updatedAt}</small>
-            </button>
-          ))}
+          {chats.length === 0 ? (
+            <div className="history-empty">暂无对话</div>
+          ) : (
+            chats.map((chat) => (
+              <div className={`history-row ${chat.id === activeChatId ? "active" : ""}`} key={chat.id}>
+                <button className="history-item" type="button" onClick={() => onOpen(chat.id)}>
+                  <span>{chat.title}</span>
+                  <small>{chat.updatedAt}</small>
+                </button>
+                <button
+                  className="history-clear"
+                  type="button"
+                  aria-label={`清除 ${chat.title}`}
+                  onClick={() => onClear(chat.id)}
+                >
+                  <Trash2 size={14} />
+                </button>
+              </div>
+            ))
+          )}
         </div>
       </aside>
       <section className="chat-main">{children}</section>
@@ -739,36 +1343,94 @@ function ExistingChat({
   input,
   setInput,
   onSubmit,
+  onClear,
 }: {
   chat: AgentChat;
   input: string;
   setInput: (value: string) => void;
   onSubmit: (event: FormEvent) => void;
+  onClear: () => void;
 }) {
+  const [menuOpen, setMenuOpen] = useState(false);
+
   return (
     <div className="conversation">
       <header className="conversation-header">
         <strong>{chat.title}</strong>
-        <span>•••</span>
+        <div className="conversation-menu">
+          <button
+            className="conversation-menu-trigger"
+            type="button"
+            aria-label="打开对话菜单"
+            aria-expanded={menuOpen}
+            onClick={() => setMenuOpen((open) => !open)}
+          >
+            <MoreHorizontal size={20} />
+          </button>
+          {menuOpen && (
+            <div className="conversation-dropdown" role="menu">
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setMenuOpen(false);
+                  onClear();
+                }}
+              >
+                <Trash2 size={15} />
+                Clear chat
+              </button>
+            </div>
+          )}
+        </div>
       </header>
       <div className="message-column">
         {chat.messages.map((message) => (
-          <article className={`message ${message.role}`} key={message.id}>
-            <p>{message.content}</p>
-            {message.citations && message.citations.length > 0 && (
-              <div className="citation-box">
-                {message.citations.map((citation) => (
-                  <span key={citation.source}>
-                    {citation.label}: <code>{citation.source}</code>
-                  </span>
-                ))}
-              </div>
+          <article className={`message ${message.role} ${message.pending ? "pending" : ""}`} key={message.id}>
+            {message.pending && message.thinkingStep ? (
+              <ThinkingCard step={message.thinkingStep} />
+            ) : message.role === "assistant" ? (
+              <MarkdownContent content={message.content} />
+            ) : (
+              <p>{message.content}</p>
             )}
           </article>
         ))}
       </div>
       <div className="conversation-composer">
         <ChatComposer placeholder="要求后续变更" input={input} setInput={setInput} onSubmit={onSubmit} compact />
+      </div>
+    </div>
+  );
+}
+
+function MarkdownContent({ content }: { content: string }) {
+  return (
+    <div className="markdown-content">
+      <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
+    </div>
+  );
+}
+
+function ThinkingCard({ step }: { step: string }) {
+  const stages = ["理解问题", "检索本地记录", "组织证据", "生成回答"];
+
+  return (
+    <div className="thinking-card" aria-live="polite">
+      <div className="thinking-card-header">
+        <span className="thinking-pulse">
+          <i />
+          <i />
+          <i />
+        </span>
+        <strong>{step}</strong>
+      </div>
+      <div className="thinking-stage-row">
+        {stages.map((stage, index) => (
+          <span key={stage} style={{ animationDelay: `${index * 180}ms` }}>
+            {stage}
+          </span>
+        ))}
       </div>
     </div>
   );
@@ -787,12 +1449,34 @@ function ChatComposer({
   onSubmit: (event: FormEvent) => void;
   compact?: boolean;
 }) {
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+
+  useEffect(() => {
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+    textarea.style.height = "auto";
+    textarea.style.height = `${Math.min(Math.max(textarea.scrollHeight, 58), 168)}px`;
+  }, [input]);
+
   return (
-    <form className={`composer ${compact ? "compact" : ""}`} onSubmit={onSubmit}>
-      <textarea value={input} onChange={(event) => setInput(event.target.value)} placeholder={placeholder} rows={3} />
-      <button type="submit" aria-label="发送">
-        {compact ? <ArrowUp size={20} /> : <Send size={20} />}
-      </button>
+    <form className={`composer ${compact ? "compact" : ""} ${input.trim() ? "has-input" : ""}`} onSubmit={onSubmit}>
+      <textarea
+        ref={textareaRef}
+        value={input}
+        onChange={(event) => setInput(event.target.value)}
+        onKeyDown={(event: KeyboardEvent<HTMLTextAreaElement>) => {
+          if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) return;
+          event.preventDefault();
+          event.currentTarget.form?.requestSubmit();
+        }}
+        placeholder={placeholder}
+        rows={2}
+      />
+      <div className="composer-actions" aria-hidden="false">
+        <button type="submit" aria-label="发送">
+          <ArrowUp size={20} />
+        </button>
+      </div>
     </form>
   );
 }
@@ -801,6 +1485,214 @@ function errorMessage(error: unknown) {
   if (error instanceof Error) return error.message;
   if (typeof error === "string") return error;
   return JSON.stringify(error);
+}
+
+function setupEnvironmentReady(diagnose: DiagnoseResult) {
+  const checkByKey = new Map(diagnose.checks.map((check) => [check.key, check]));
+  return SETUP_DEPENDENCY_KEYS.every((key) => checkByKey.get(key)?.ok);
+}
+
+function createInitProgress(statuses: Partial<Record<InitProgressStep["key"], InitProgressStatus>> = {}): InitProgressStep[] {
+  return [
+    {
+      key: "config",
+      label: "检查是否需要初始化",
+      detail: "确认本机配置和读取状态",
+      status: statuses.config ?? "pending",
+    },
+    {
+      key: "query",
+      label: "执行本机初始化",
+      detail: "会打开 Terminal 执行 wx-cli 推荐流程",
+      status: statuses.query ?? "pending",
+    },
+    {
+      key: "finish",
+      label: "验证读取能力",
+      detail: "读取 1 条微信会话",
+      status: statuses.finish ?? "pending",
+    },
+  ];
+}
+
+function activeInitProgressStep(steps: InitProgressStep[]) {
+  return (
+    steps.find((step) => step.status === "checking") ??
+    steps.find((step) => step.status === "blocked") ??
+    null
+  );
+}
+
+function setupChecks(diagnose: DiagnoseResult | null, phase: SetupPhase, setupLog: string): SetupCheck[] {
+  const labels: Record<string, string> = {
+    node: "准备运行环境",
+    npm: "准备安装能力",
+    wechat: "找到 Mac 微信",
+    wx: "准备微信读取能力",
+  };
+  const details: Record<string, string> = {
+    node: "用于在本机运行微信助手",
+    npm: "用于自动准备缺少的组件",
+    wechat: "确认这台 Mac 已安装微信",
+    wx: "让 App 能读取本机微信记录",
+  };
+
+  if (!diagnose) {
+    return SETUP_DEPENDENCY_KEYS.map((key, index) => ({
+      key,
+      label: labels[key],
+      detail: index === 0 ? setupLog : details[key],
+      status: phase === "idle" ? "pending" : index === 0 ? "checking" : "pending",
+    }));
+  }
+
+  const checkByKey = new Map(diagnose.checks.map((check) => [check.key, check]));
+  const firstBlockedIndex = SETUP_DEPENDENCY_KEYS.findIndex((key) => checkByKey.get(key)?.ok === false);
+  const activeIndex = phase === "checking" || phase === "verifying" ? firstBlockedIndex : -1;
+
+  return SETUP_DEPENDENCY_KEYS.map((key, index) => {
+    const check = checkByKey.get(key);
+    let status: SetupCheckStatus = check?.ok ? "ready" : "blocked";
+
+    if (!check) {
+      status = "pending";
+    } else if (phase === "installing" && key === "wx" && !check.ok) {
+      status = "checking";
+    } else if (activeIndex === index && !check.ok) {
+      status = "checking";
+    }
+
+    return {
+      key,
+      label: labels[key],
+      detail: setupCheckDetail(key, check, details[key]),
+      status,
+    };
+  });
+}
+
+function setupCheckDetail(key: string, check: CheckItem | undefined, fallback: string) {
+  if (!check) return fallback;
+  if (check.ok) {
+    if (key === "wechat") return "已找到 Mac 微信";
+    return "已准备好";
+  }
+  return fallback;
+}
+
+function setupLogLines(checks: SetupCheck[], phase: SetupPhase) {
+  const lines: Array<{ text: string; prefix: string; tone?: "default" | "muted" | "success" | "warning" }> = [];
+
+  for (const check of checks) {
+    if (check.status === "ready") {
+      lines.push({ prefix: "ok", text: `${check.label}检查完成`, tone: "success" });
+    } else if (check.status === "blocked") {
+      lines.push({ prefix: "!", text: `${check.label}需要处理`, tone: "warning" });
+    } else if (check.status === "checking") {
+      lines.push({ prefix: "run", text: `正在检查 ${check.label}` });
+      if (check.detail) {
+        lines.push({ prefix: "info", text: check.detail, tone: "muted" });
+      }
+    }
+  }
+
+  if (phase === "ready") {
+    lines.push({ prefix: "ok", text: "所有检查已完成", tone: "success" });
+  } else if (phase === "needsAttention" || phase === "error") {
+    lines.push({ prefix: "!", text: "还有项目需要处理", tone: "warning" });
+  }
+
+  return lines.length > 0 ? lines : [{ prefix: "$", text: "准备开始检查" }];
+}
+
+function permissionStateCopy(status: PermissionStatus, permissionOpened: boolean, detail: string) {
+  if (status === "checking") {
+    return {
+      title: "正在检查完全磁盘访问",
+      text: "正在确认微信助手是否能读取本机微信数据目录。",
+    };
+  }
+
+  if (status === "granted") {
+    return {
+      title: "完全磁盘访问已确认",
+      text: "已检测到可读取的微信数据目录，可以进入下一步初始化。",
+    };
+  }
+
+  if (status === "error") {
+    return {
+      title: "权限检查失败",
+      text: detail,
+    };
+  }
+
+  return {
+    title: permissionOpened ? "尚未检测到完整授权" : "尚未授予完全磁盘访问",
+    text: permissionOpened
+      ? "完成授权后点击右下角重新检查；如仍未通过，请重启微信助手。"
+      : "微信数据路径当前不可读取，请先打开系统设置授权。",
+  };
+}
+
+function initStateCopy(status: InitStatus, detail: string) {
+  const { text: cleanedDetail, log } = splitInitDetail(detail);
+
+  if (status === "checking") {
+    return {
+      title: "正在判断是否需要初始化",
+      text: "正在读取本机配置，并尝试验证 1 条微信会话。",
+    };
+  }
+
+  if (status === "ready") {
+    return {
+      title: "初始化已完成",
+      text: "本机微信读取能力已经可用，可以直接进入下一步。",
+    };
+  }
+
+  if (status === "initializing") {
+    return {
+      title: "正在执行初始化",
+      text: "正在打开 Terminal，准备执行 wx-cli 推荐初始化流程。",
+    };
+  }
+
+  if (status === "waitingExternal") {
+    return {
+      title: "等待 Terminal 初始化完成",
+      text: cleanedDetail || "请在 Terminal 中完成初始化，然后回到这里重新检查。",
+      log,
+    };
+  }
+
+  if (status === "error") {
+    return {
+      title: "初始化失败",
+      text: cleanedDetail,
+      log,
+    };
+  }
+
+  return {
+    title: "需要初始化",
+    text: cleanedDetail || "尚未检测到可用的本机微信读取能力，需要执行一次初始化。",
+    log,
+  };
+}
+
+function splitInitDetail(detail: string) {
+  const marker = "[[INIT_LOG]]";
+  const index = detail.indexOf(marker);
+  if (index === -1) {
+    return { text: detail, log: "" };
+  }
+
+  return {
+    text: detail.slice(0, index).trim(),
+    log: detail.slice(index + marker.length).trim(),
+  };
 }
 
 function resolveQuestionSession(question: string, sessions: SessionSummary[]) {
@@ -843,7 +1735,7 @@ function normalizeForSessionMatch(value: string) {
 
 function sessionClarificationMessage(options: SessionSummary[]) {
   if (options.length === 0) {
-    return "我还不能确定要检索哪个微信会话，而且当前没有从本机工具里读到可用会话名。请先确认 opencli wx sessions 能列出联系人或群聊，然后在问题里写出明确的群名或联系人名。";
+    return "我还不能确定要检索哪个微信会话，而且当前没有从本机工具里读到可用会话名。请先确认 wx sessions 能列出联系人或群聊，然后在问题里写出明确的群名或联系人名。";
   }
 
   const optionLines = options.map((session) => `- ${session.title}`).join("\n");
@@ -865,7 +1757,7 @@ const onboardingCopy: Record<
     kicker: "欢迎",
     stepLabel: "Step 1 / 5",
     title: "先连接你的本机微信",
-    description: "微信助手会自动检查环境、安装 wx-cli / opencli，并在需要你确认时停下来。",
+    description: "微信助手会自动检查环境、安装 wx-cli，并在需要你确认时停下来。",
     leftTitle: "把微信历史变成可以提问的上下文",
     leftDescription: "桌面端负责本地工具、授权和初始化，数据默认留在你的 Mac 上。",
   },
@@ -881,7 +1773,7 @@ const onboardingCopy: Record<
     kicker: "需要授权",
     stepLabel: "Step 3 / 5",
     title: "允许读取本机微信数据",
-    description: "macOS 需要你手动授予完全磁盘访问。授权后回到这里，桌面端会继续验证。",
+    description: "macOS 需要你手动授予完全磁盘访问。授权后回到这里，桌面端会继续验证；如果仍未通过，请重启微信助手。",
     leftTitle: "权限请求要明确、可信、可返回",
     leftDescription: "这里不能静默处理，所以要告诉用户为什么需要权限，以及授权后会继续检查。",
   },
